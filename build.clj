@@ -6,7 +6,7 @@
 ;;
 ;;   clojure -T:build jar       ; target/agentspaces-clj-<version>.jar and its pom
 ;;   clojure -T:build install   ; that jar into ~/.m2
-;;   clojure -T:build deploy    ; that jar to Clojars (CLOJARS_USERNAME, CLOJARS_PASSWORD)
+;;   clojure -T:build:deploy deploy   ; that jar to Clojars (CLOJARS_USERNAME, CLOJARS_PASSWORD)
 ;;
 ;; The Java dependencies (ai.badmonkey.agentspaces/agentspaces-*) resolve from
 ;; Maven Central; Clojars carries only this library.

@@ -39,10 +39,13 @@ clojure -T:build jar       # target/agentspaces-clj-<version>.jar, source-only, 
 clojure -T:build install   # the jar into ~/.m2, to try it from another project
 ```
 
-Releases go to Clojars from a version tag (`v0.2.0`), through
-`.github/workflows/release.yml`. Maintainers can deploy by hand with
+Maintainers release to Clojars by hand. Bump `version` in `build.clj`, run the
+suite, tag the commit `v<version>` (for example `v0.2.0`), and deploy with
 `CLOJARS_USERNAME` and `CLOJARS_PASSWORD` (a deploy token) set:
-`clojure -T:build:deploy deploy`.
+
+```
+clojure -T:build:deploy deploy
+```
 
 ## Developer Certificate of Origin (DCO)
 
