@@ -1,0 +1,33 @@
+;; Copyright 2026 Bad Monkey, Inc.
+;; Licensed under the Apache License, Version 2.0.
+;;
+;; Clojure bindings for AgentSpaces. Dependencies are Maven coordinates on
+;; purpose: this project consumes the published agentspaces artifacts from a
+;; repository (your ~/.m2 after `mvn install`, or a remote repository once the
+;; artifacts are deployed), never a filesystem reference into the Java build.
+;; Versions are plain Maven Central versions; the agentspaces artifacts follow
+;; the main repo's version.
+{:paths ["src"]
+
+ :deps {org.clojure/clojure {:mvn/version "1.11.1"}
+        ai.badmonkey.agentspaces/agentspaces-common {:mvn/version "0.2.0"}
+        ai.badmonkey.agentspaces/agentspaces-api {:mvn/version "0.2.0"}
+        ai.badmonkey.agentspaces/agentspaces-identity {:mvn/version "0.2.0"}
+        ai.badmonkey.agentspaces/agentspaces-space {:mvn/version "0.2.0"}
+        ai.badmonkey.agentspaces/agentspaces-peering {:mvn/version "0.2.0"}
+        ;; DiscoveryService, for `:group {:advertise true}` (space advertisements).
+        ai.badmonkey.agentspaces/agentspaces-discovery {:mvn/version "0.2.0"}
+        ;; GroupKeyDistributor and CapabilityRuntime, for :content-key-rotation (v0.1.13).
+        ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.2.0"}}
+
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {ai.badmonkey.agentspaces/agentspaces-test-support
+                      {:mvn/version "0.2.0"}}
+         :main-opts ["-e" "(require 'agentspaces.run-tests) (agentspaces.run-tests/-main)"]}
+
+  ;; The release build: clojure -T:build jar | install. See build.clj.
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
+          :ns-default build}
+  ;; Added only to publish: clojure -T:build:deploy deploy
+  :deploy {:deps {slipset/deps-deploy {:mvn/version "0.2.5"}}}}}

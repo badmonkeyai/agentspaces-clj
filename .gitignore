@@ -1,0 +1,39 @@
+# AgentSpaces Clojure bindings (deps.edn / tools.deps project).
+
+# Classpath cache, compiled classes, build output
+.cpcache/
+classes/
+target/
+*.class
+*.jar
+pom.xml.asc
+
+# REPL and tooling state
+.nrepl-port
+.nrepl-history
+.socket-repl-port
+.rebel_readline_history
+.cljs_node_repl/
+.lsp/
+.clj-kondo/.cache/
+.calva/output-window/
+.portal/
+.rebl/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CI checks the AgentSpaces core out beside the build
+/agentspaces-core/
+
+# Logs and local environment
+*.log
+.env
