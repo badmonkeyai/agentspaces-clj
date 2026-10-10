@@ -90,13 +90,22 @@ strings.
 (core/agent-id "z6Mk.../worker")         ;=> AgentId
 ```
 
-Three namespaces carry everything:
+Ten namespaces carry everything. The first three are the data layer, the
+space verbs, and the peer; `agents` is the programming model (§10.1); the
+rest each work one capability the `:capabilities` block registers (§10.2).
 
 | Namespace | Carries |
 |---|---|
 | `agentspaces.core` | `duration`, `lease`, `peer-id`, `agent-id`, `to-entry`, `from-entry`, `raw`, `template` |
-| `agentspaces.space` | `local`, `as`, `write!`, `read`, `read-all`, `take!`, `taken`, `complete!`, `renew!`, `cancel!`, `notify!`, `unsubscribe!`, `grant!`, `revoke!` |
+| `agentspaces.space` | `local`, `as`, `write!`, `read`, `read-all`, `read-entries`, `take!`, `taken`, `complete!`, `renew!`, `cancel!`, `notify!`, `unsubscribe!`, `grant!`, `revoke!` |
 | `agentspaces.fleet` | `start`, `stop!`, `space`, `found-group`, `peer-id`, `writer`, `agent`, `revoke!`, `revoked?`, `rotate-content-key!`, `group-uri` |
+| `agentspaces.agents` | `defagent`, `bind!`, `unbind!`, `card`, and the returns `motion`, `contribution`, `tagged`, `convert-out` |
+| `agentspaces.vote` | `propose!`, `cast!`, `proposal`, `tally`, `decision`, `on-decision!` over the vote capability |
+| `agentspaces.aggregate` | `start!`, `estimate`, `tick!`, `await-settled`, `on-estimate!` over the push-sum aggregate |
+| `agentspaces.ordered` | `take!`, `complete!`, `leader?`: the exactly-once take through the ordered log |
+| `agentspaces.semantic` | `query`, `remote-query`: the group's cards ranked by meaning, locally or across peers |
+| `agentspaces.learn` | `start!`, `model`, `round`, `end-epoch!` over gossip learning |
+| `agentspaces.remote` | `actions`, `invoke!`: a foreign card's invocable actions, called with a map |
 
 ## 3. One peer, from a config map
 
@@ -614,7 +623,14 @@ the flag.
 (space/read work TaskEntry {:fresh true :timeout "5s"})
 (space/read-all work TaskEntry {:where {:priority [:gte 3]} :limit 50})
 (space/read-all work TaskEntry {:fresh true})
+(space/read-entries work TaskEntry {:tags {:region "eu"}})
+;=> [{:value {..} :entry-id .. :issuer .. :tags {"region" "eu"} :expires-at #inst .. :issued ..}]
 ```
+
+`read-entries` is `read-all` with each entry's metadata around it
+(`Space.readAllEntries`): the value map under `:value`, the `EntryId`, the
+issuing `AgentId`, the tags as a string map, the lease expiry as an
+`Instant`, and the HLC issue stamp.
 
 **Take.** Destructive and exclusive under the space's conflict strategy. The
 result carries the fabric handle in metadata for `complete!` and `renew!`. If
@@ -638,8 +654,10 @@ reappears for another worker. That is the heart of the model.
 
 **Notify.** Subscribes a function to matching events. Events arrive as maps
 with `:kind` one of `:written`, `:taken`, `:completed`, `:expired`,
-`:reappeared`, plus `:entry` and `:entry-id`. The callback runs on the
-space's delivery thread, so return promptly and hand slow work elsewhere.
+`:reappeared`, plus `:entry`, `:entry-id`, `:tags` (the entry's tags as a
+string map), and `:details` (the same metadata map `read-entries` returns,
+nil when the space supplies none). The callback runs on the space's
+delivery thread, so return promptly and hand slow work elsewhere.
 
 ```clojure
 (def sub (space/notify! work FindingEntry
@@ -674,7 +692,7 @@ bounds compare numerically, so Clojure longs match `int` components.
 `core/template` compiles a `:where` map into the fabric's `Template` when you
 need the raw object.
 
-## 10. The system map and interop
+## 10. The system map, agents, and capabilities
 
 `fleet/start` returns everything it built:
 
@@ -686,37 +704,165 @@ need the raw object.
 | `:spaces` | name to `ReplicatedSpace`; `(fleet/space system "tasks")` |
 | `:authorizer` | the profile's `Authorizer` (§4) |
 | `:blocks` | the group's `BlockExchange` |
-| `:discovery` | the `DiscoveryService`, when `:advertise true` |
+| `:discovery` | the `DiscoveryService`, when `:advertise`, `:agents`, or `:capabilities` is set |
+| `:facade` `:group-context` | the `AgentSpaces` facade and this group's context: agents bind through them |
+| `:capabilities` | the layer-4 providers the `:capabilities` block registered, by key |
 | `:founding` | the `SignedGroupAdvertisement`, when this node founded the group |
 | `:profile` `:transport` `:channel-auth` | the effective posture |
 | `:config` | the map you passed |
 
-Anything the map interface does not cover is one interop call away. The
-capability services (SPEC §8) are the main example: the bindings do not wrap
-them, because that would add the capabilities module to every consumer's
-dependency graph. Add it to your own `deps.edn` and use the raw runtime.
+### 10.1 Agents: `defagent` and `bind!`
+
+The programming model of the Java annotations (`@SpaceTake`, `@SpaceNotify`,
+`@BidFunction`, `@Ballot`, `@OnDecision`, `@OrderedTake`, `@OnEstimate`,
+`@Propose`, `@SpaceJoin`, `@SpaceReduce`) as one Clojure form.
+`agentspaces.agents/defagent` writes a Java interface whose methods carry the
+annotations as metadata and a constructor that reifies it; `bind!` hands the
+object to the Java `AgentBinder` through the facade, which runs the loops,
+renews the leases, dedups, casts, and publishes the AgentCard. Nothing is
+reimplemented, and the binder reads the annotations through the interface.
 
 ```clojure
-;; deps.edn: ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.2.0"}
-(import 'ai.badmonkey.agentspaces.capabilities.runtime.CapabilityPipes
-        'ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate
-        'ai.badmonkey.agentspaces.common.codec.CborCodec
-        'java.time.InstantSource)
+(require '[agentspaces.agents :as agents :refer [defagent]])
 
-(let [runtime (:runtime system)
-      pipes   (CapabilityPipes. runtime (CborCodec/defaultCodec))
-      agg     (PushSumAggregate. pipes (.sampler runtime) (fleet/peer-id system)
-                                 (CborCodec/defaultCodec) (InstantSource/system))]
-  (.start agg "battery" 0.72)          ; this node's local value
-  ;; tick alongside the node, then read the converging fleet average
-  (.estimate agg "battery"))
+(defagent Pricer
+  {:description "Prices an order" :goals ["price orders"]}
+  (take price [^PriceRequest r] {:space "tasks" :lease "10m"} ^Quote
+    (->Quote (:item r) (:quantity r) (* 4.25 (:quantity r))))
+  (ballot judge [^VoteCapability$Proposal p] {:space "votes"} ^String
+    (if (.contains ^String (:question p) "ship") "approve" nil))
+  (notify audit [^Quote q] {:space "tasks" :result-space "ledger"} ^Receipt
+    (->Receipt (:item q))))
+
+(def bound (agents/bind! system (->Pricer)))   ; a system from fleet/start
+(agents/card bound)                             ; {:agent "pricer" :consumes [..] :actions [..]}
+(agents/unbind! bound)
 ```
 
-The same pattern reaches `VoteCapability` (quorum votes), `RaftLog` and
-`OrderedTakes` (the ordered log and exactly-once takes), `GossipLearning`,
-`SemanticDiscovery`, and `GroupKeyDistributor` (sealed distribution of the
-content key to admitted members). Registering them with a `CapabilityRuntime`
-advertises them to the group and keeps the advertisements refreshed.
+`agents/card` is the bound agent's `AgentCard` as a map: `:agent`,
+`:description`, `:goals`, `:consumes`, `:produces`, and `:actions`, each
+action `{:name :kind :description}` (the method name, the verb, and the
+verb's `:description`, which falls back to the agent's). Under `:agent-keys
+:subordinate` (§6) the card also carries `:agent-public-key`, the key the
+agent signs with, and `:certificate`, the peer-signed `AgentCertificate` that
+proves it, as a map of `:agent`, `:agent-public-key`, `:issued`, `:ttl`,
+`:expires-at`, `:peer-signature`, and `:encryption-public-key`. A peer-signed
+agent reports nil for both.
+
+Each verb is `(verb name [^Type params] opts ^ReturnType body...)`: the
+parameter types and the return hint are the entry types the fleet sees (the
+card declares them, remote callers rely on them), parameters arrive as maps,
+and a return hinted with a record class is converted back. Options are the
+annotation's attributes in kebab case (`:space`, `:lease`, `:poll-timeout`,
+`:result-space`, `:tags`, `:where`, `:prefix`, `:key`, `:parts`, `:mode`,
+`:produces`, ...). `:tags ["region=eu"]` and `:where ["priority=1"]` narrow
+a take, notify, ordered-take, propose, reduce, or join part the way the Java
+string filters do. `:mode` takes `:local`, `:leased`, or `:ordered` on a
+join (default `:local`) and `:leased` or `:ordered` on a reduce (default
+`:leased`); the macro writes the matching `SpaceJoin.Mode` or
+`SpaceReduce.Mode` constant into the annotation and refuses any other
+value at expansion. A verb that needs a capability (ballot, on-decision,
+ordered-take, on-estimate, propose, an ordered join or reduce) needs it in
+the config's `:capabilities` block below, and fails at `bind!` naming the
+missing one otherwise, as under Java.
+
+**Returns.** Beyond a record (a map converted through the return hint, or
+the instance itself) and nil (complete, write nothing), a verb body may
+return four more things, each converted by `agents/convert-out`:
+
+```clojure
+;; A motion: the binder completes the take, then opens the vote once per
+;; proposal id as the bound agent. Declare the return ^Motion; the card then
+;; lists a Proposal, and bind! fails fast when no vote capability is registered.
+(take escalate [^TaskEntry t] {:space "work"} ^Motion
+  (agents/motion {:id (str "m-" (:topic t)) :question "ship?" :options ["yes" "no"]
+                  :quorum 2 :space "votes" :lease "1h"}))
+
+;; A contribution: the binder completes the take (or reads the cue), writes
+;; nothing, and starts or joins the push-sum epoch with this peer's share,
+;; through the aggregate :capabilities {:aggregate true} registers. Declare the
+;; return ^Contribution and bind! fails fast without an aggregate. A map
+;; {:epoch .. :value ..} under that hint converts the same way.
+(notify feel [^Reading r] {:space "readings"} ^Contribution
+  (agents/contribution (:topic r) (:value r)))
+
+;; A tagged entry: the entry is written with the tags on it. Declare no
+;; return hint (the method returns Object) and name the entry class under
+;; :produces, which converts a map entry and feeds the card. A plain
+;; {:entry m :tags {..}} map reads the same way.
+(take label [^TaskEntry t] {:space "work" :result-space "findings" :produces [FindingEntry]}
+  (agents/tagged {:topic (:topic t) :summary "labelled"} {:region "eu"}))
+
+;; A fork: a vector writes one entry per element (maps converted through
+;; :produces, records as they are) after the take completes once.
+(take split [^TaskEntry t] {:space "work" :result-space "findings" :produces [FindingEntry]}
+  [{:topic (:topic t) :summary "part 1"} {:topic (:topic t) :summary "part 2"}])
+```
+
+The hint rules follow what the Java binder reads from the declared return:
+a `Motion` return declares the Proposal it produces, while a `Tagged`
+return needs the entry type from the Java generic, which a `definterface`
+cannot carry, so the tagged and fork forms declare `Object` (no hint) and
+say what they produce through `:produces`. A tagged or fork return under a
+record hint is refused with a message saying so. Read tagged results back
+with `space/read-entries`, which carries each entry's `:tags`, and watch
+them with `space/notify!`, whose events carry `:tags` and `:details`.
+
+A join names its parts as maps under `:parts` (each the `@Part` attributes:
+`:value`, the part's class, with `:space`, `:key`, `:key-tag`, `:optional`,
+...) and receives the Java `Joined`; a reduce takes the accumulator and the
+element, both keyed by `:key`:
+
+```clojure
+(defagent Assembler
+  {:description "Joins a task with its finding by topic" :goals ["join"]}
+  (join assemble [^Joined j] {:space "work" :key "topic" :result-space "findings"
+                              :parts [{:value Fixtures$TaskEntry} {:value Fixtures$FindingEntry}]}
+    ^Fixtures$FindingEntry
+    (let [task (core/from-entry (.get j Fixtures$TaskEntry))]
+      (Fixtures$FindingEntry. (.key j) (str "joined " (:priority task))))))
+
+(defagent Tally
+  {:description "Sums priorities per topic" :goals ["reduce"]}
+  (reduce fold [^Fixtures$FindingEntry acc ^Fixtures$TaskEntry task]
+          {:space "ledger" :key "topic" :lease "2s"}
+    ^Fixtures$FindingEntry
+    (Fixtures$FindingEntry. (:topic task) (str (+ (if acc (parse-long (:summary acc)) 0) (:priority task))))))
+```
+
+### 10.2 Capabilities: the `:capabilities` block and its namespaces
+
+```clojure
+(fleet/start {:group {...}
+              :capabilities {:vote {:space "votes"}
+                             :aggregate true
+                             :ordered {:space "orders" :members [peer-id-a peer-id-b] :seed 1}
+                             :semantic true
+                             :learn {:metrics "metrics" :metrics-lease "1h"}}})
+```
+
+`:learn true` registers gossip learning without a metrics space, which is
+enough for `start!`, `model`, and `round`; `end-epoch!` writes one evaluation
+per model into a space, so it needs the map shape naming one (the lease
+defaults to 1h) and throws an `IllegalStateException` otherwise.
+
+Each key registers one layer-4 service on the facade (the starter's
+`capabilities.*`), and one namespace works it with maps:
+
+| Namespace | What it does |
+|---|---|
+| `agentspaces.vote` | `propose!` (idempotent on the id), `cast!`, `proposal`, `tally`, `decision`, `on-decision!` |
+| `agentspaces.aggregate` | `start!` (`:mode` `:avg`, `:sum`, `:count`, `:min`, `:max`), `estimate`, `await-settled` (`{:ticks :tolerance :timeout}`), `on-estimate!` |
+| `agentspaces.ordered` | `take!` through the log (exactly once across the members), `complete!`, `leader?` |
+| `agentspaces.semantic` | `query`, `remote-query`: cards ranked by meaning |
+| `agentspaces.learn` | `start!`, `model`, `round`, `end-epoch!` (evaluations as `{:model-id :epoch :loss :content-id}`, written into the metrics space) |
+| `agentspaces.remote` | `actions`: every foreign AgentCard's invocable actions; `invoke!`: write the input, await the correlated result |
+
+`core/template` takes `:tags {:region "eu"}` beside `:where`, so `read-all`,
+`take!`, and `notify!` filter by tag as the Java `whereTag` does
+(`:some?` for "present, whatever the value"). The ordered log runs over a
+fixed member list, which is why `:ordered` names the members: generate the
+identities first and pass each peer the same list, as the test does.
 
 ## 11. Defaults and choices
 
@@ -738,10 +884,12 @@ issuer, audience, and JWKS keys the way the starter does, that is a small
 addition behind an optional alias; it was left out to keep the core
 dependency graph to the fabric itself.
 
-**Capabilities are interop, not wrapped.** See §10. A `:capabilities`
-config block that registers the six shipped capabilities the way the starter's
-`agentspaces.capabilities.*` toggles do is the natural next step if a Clojure
-consumer needs them; it would add one dependency.
+**Capabilities come from the config map.** The `:capabilities` block (§10.2)
+registers the vote, aggregate, ordered, semantic, and learn services on the
+facade the way the starter's `agentspaces.capabilities.*` toggles do, and
+one namespace per capability works each with maps. This is why the bindings
+depend on `agentspaces-capabilities`; a peer with no `:capabilities` block
+registers none of them and pays nothing for the dependency at run time.
 
 **One group per system.** `:group` is a single map. A process that joins
 several groups starts several systems, one per group, sharing an identity
@@ -800,8 +948,9 @@ the bundled tests use bounded polling helpers for this.
 
 ## 13. Tests
 
-`clj -M:test` runs twenty-four tests. The data layer and every space verb run
-over a `LocalSpace`; then real fleets over loopback exercise each config
+`clj -M:test` runs sixty-three tests. The data layer and every space verb run
+over a `LocalSpace`, `read-entries` and the tags and details on notify events
+among them; then real fleets over loopback exercise each config
 interface: a TCP take and complete round trip between two peers; an
 attested-TLS pair that negotiates bare frames; a founder plus a peer that
 joins by GroupID alone and finds the advertised space; an allowlist space
@@ -828,6 +977,42 @@ tag-sharded replica that keeps only its own. Seven v0.1.13 tests cover the rest:
 - a content-key rotation every member follows, including one that sets only
   `:content-key`, with the default cutover of two gossip periods plus 30s and a
   warning when no `:keystore` persists the ring.
+
+The layer 3 and 4 suites bind `defagent` agents over two TCP peers: a take,
+a ballot with an on-decision, the aggregate, ordered, semantic, and remote
+namespaces, tag templates and bid functions; a LOCAL join, a LEASED join,
+and a reduce with the default and the explicit `:mode :leased`, with the
+`:mode` enum read back from the generated interface; the three returns (a
+motion the vote namespace sees on both peers, a tagged entry read back with
+`read-entries`, a fork landing two entries) and the `convert-out` rules on
+their own; and the remaining verbs: `propose` opening one vote per cue key,
+`on-estimate` writing a finding once the aggregate settles, `ordered-take`
+handling each entry once across two takers, and a take narrowed by `:tags`
+and `:where` that leaves the other entries alone.
+
+The parity suites close what the audit of these bindings against the Java
+annotations found untested, again over two TCP peers:
+- the reacting verbs and returns: `notify` firing once per written entry
+  with its result in `:result-space` and the cue left in place; `bid`
+  pricing an AUCTION space where the cheaper bid takes every lot; a
+  `contribution` return feeding the aggregate until the fleet mean settles;
+  and `space/notify!` reporting `:expired` once a 1s write lease lapses on
+  the other replica's sweep;
+- the options: `:result-lease` bounding the result entry's `:expires-at`
+  and `:description` reaching the card action; a join in `:mode :ordered`
+  firing once per key across two joiners and draining its tickets; `@Part`
+  `:at-least`, `:key-tag`, and `:optional`, and `:within` with `:max-open`
+  finding a forgotten or evicted key again; a reduce in `:mode :ordered`
+  under an `:accumulator-lease`, and by `:key-tag` leaving untagged elements
+  alone; a propose keyed by `:key-tag`; each option read back from the
+  generated interface;
+- the capabilities: `semantic/remote-query` asking the other peer to rank
+  the card it published, and `learn` averaging two models to the fleet mean
+  and ending an epoch into the metrics space, plus `:learn true` refusing to
+  end one;
+- the card: `:certificate` and `:agent-public-key` under
+  `:agent-keys :subordinate`, mirroring the raw `AgentCard`, and nil for a
+  peer-signed agent.
 
 ---
 

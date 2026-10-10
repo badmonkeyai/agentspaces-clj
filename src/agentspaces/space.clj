@@ -13,8 +13,8 @@
 ;; limitations under the License.
 
 (ns agentspaces.space
-  "The space verbs, data-oriented: write!, read, read-all, take!, complete!,
-  and notify!, over any Space implementation (a LocalSpace for one process,
+  "The space verbs, data-oriented: write!, read, read-all, read-entries,
+  take!, complete!, and notify!, over any Space implementation (a LocalSpace for one process,
   a ReplicatedSpace from `agentspaces.fleet/start` for a fleet).
 
   Entries travel as Clojure maps against a Java record class that names the
@@ -28,13 +28,13 @@
   (:refer-clojure :exclude [read])
   (:require [agentspaces.core :as core]
             [clojure.string :as str])
-  (:import (ai.badmonkey.agentspaces.api.space EntryHandle Space SpaceEvent
+  (:import (ai.badmonkey.agentspaces.api.space EntryHandle Space Space$Entry SpaceEvent
                                                SpaceListener Subscription TakenEntry)
            (ai.badmonkey.agentspaces.common.id AgentId PeerId)
            (ai.badmonkey.agentspaces.space ConsistencyHint)
            (ai.badmonkey.agentspaces.space.local LocalSpace)
            (ai.badmonkey.agentspaces.space.replicated ReplicatedSpace SpaceAdmission$Scope)
-           (java.time Duration)))
+           (java.time Duration Instant)))
 
 (set! *warn-on-reflection* true)
 
@@ -129,6 +129,30 @@
              (.readAll ^ReplicatedSpace space t ConsistencyHint/FRESH (int limit))
              (.readAll ^Space space t (int limit)))))))
 
+(defn- entry-view
+  "A Space.Entry as a map: the value (through `from-entry`), its id, issuer,
+  tags, lease expiry, and issue stamp; nil for nil."
+  [^Space$Entry e]
+  (when e
+    (let [lease (.lease e)]
+      {:value (core/from-entry (.value e))
+       :entry-id (.entryId e)
+       :issuer (.issuer e)
+       :tags (into {} (.tags e))
+       :expires-at (when lease (Instant/ofEpochMilli (.expiresAtMillis lease)))
+       :issued (.issued e)})))
+
+(defn read-entries
+  "Every current match with its metadata (Space.readAllEntries), capped by
+  `:limit` (default 100): a vector of {:value <map> :entry-id <EntryId>
+  :issuer <AgentId> :tags {\"k\" \"v\"} :expires-at <Instant> :issued
+  <HlcTimestamp>}. `:where` and `:tags` narrow it as in `read-all`.
+
+      (space/read-entries space FindingEntry {:tags {:region \"eu\"}})"
+  ([space type] (read-entries space type {}))
+  ([space type {:keys [limit] :or {limit 100} :as opts}]
+   (mapv entry-view (.readAllEntries ^Space space (core/template type opts) (int limit)))))
+
 (defn take!
   "A destructive, exclusive match under the space's conflict strategy.
   Returns the entry map with the fabric handle under `:taken`, or nil when
@@ -194,8 +218,11 @@
   "Subscribes `callback` to matching space events and returns the
   Subscription (close it, or `unsubscribe!` it, to stop). The callback
   receives {:kind :written|:taken|:completed|:expired|:reappeared,
-  :entry <map>, :entry-id <EntryId>}; its return value is ignored, and it
-  runs on the space's delivery thread, so return promptly.
+  :entry <map>, :entry-id <EntryId>, :tags {\"k\" \"v\"}, :details <map>},
+  where `:tags` are the entry's tags and `:details` is the entry's metadata
+  view as `read-entries` returns it (nil when the space supplies none); its
+  return value is ignored, and it runs on the space's delivery thread, so
+  return promptly.
 
       (notify! space FindingEntry
                (fn [{:keys [kind entry]}]
@@ -208,7 +235,9 @@
               (onEvent [_ event]
                 (callback {:kind (keyword (.toLowerCase (.name (.kind ^SpaceEvent event))))
                            :entry (core/from-entry (.entry ^SpaceEvent event))
-                           :entry-id (.entryId ^SpaceEvent event)})))
+                           :entry-id (.entryId ^SpaceEvent event)
+                           :tags (into {} (.tags ^SpaceEvent event))
+                           :details (entry-view (.details ^SpaceEvent event))})))
             (core/lease lease))))
 
 (defn unsubscribe!

@@ -178,15 +178,19 @@
     :else (Matchers/eq spec)))
 
 (defn template
-  "Compiles an entry class and an optional `:where` map into a Template.
-  Each `:where` value is an equality by default; a vector names an operator:
-  [:gte 5], [:ne \"x\"], [:in \"a\" \"b\"], [:contains \"frag\"], [:nil?],
-  [:some?]; a function becomes a predicate matcher; a Matcher passes through.
+  "Compiles an entry class and optional `:where` and `:tags` maps into a
+  Template. Each `:where` value is an equality by default; a vector names an
+  operator: [:gte 5], [:ne \"x\"], [:in \"a\" \"b\"], [:contains \"frag\"],
+  [:nil?], [:some?]; a function becomes a predicate matcher; a Matcher passes
+  through. `:tags` applies the same specs to the entry's tags (whereTag);
+  a tag spec of `:some?` means the tag must be present whatever its value.
 
-      (template TaskEntry {:where {:topic \"indexing\" :priority [:gte 5]}})"
+      (template TaskEntry {:where {:topic \"indexing\" :priority [:gte 5]}
+                           :tags {:region \"eu\"}})"
   (^Template [^Class type] (Template/of type))
-  (^Template [^Class type {:keys [where]}]
-   (reduce-kv (fn [^Template t k spec]
-                (.where t (name k) (matcher spec)))
-              (Template/of type)
-              (or where {}))))
+  (^Template [^Class type {:keys [where tags]}]
+   (as-> (Template/of type) t
+     (reduce-kv (fn [^Template t k spec] (.where t (name k) (matcher spec))) t (or where {}))
+     (reduce-kv (fn [^Template t k spec]
+                  (.whereTag t (name k) (matcher (if (= spec :some?) [:some?] spec))))
+                t (or tags {})))))

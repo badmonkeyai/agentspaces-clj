@@ -39,6 +39,14 @@
                                             PeerAdvertisement$Endpoint
                                             PeerAdvertisement$PeerRole
                                             SpaceAdvertisement$Admission)
+           (ai.badmonkey.agentspaces.agent AgentIdentityFactory AgentSpaces AgentSpaces$GroupContext)
+           (ai.badmonkey.agentspaces.capabilities.aggregate PushSumAggregate)
+           (ai.badmonkey.agentspaces.capabilities.learn GossipLearner GossipLearner$Builder
+                                                        GossipLearning WeightAveraging)
+           (ai.badmonkey.agentspaces.capabilities.orderedlog OrderedTakes)
+           (ai.badmonkey.agentspaces.capabilities.runtime CapabilityPipes CapabilityRuntime)
+           (ai.badmonkey.agentspaces.capabilities.semantic HashingEmbedder SemanticDiscovery)
+           (ai.badmonkey.agentspaces.capabilities.vote VoteCapability)
            (ai.badmonkey.agentspaces.api.security SecurityProfile)
            (ai.badmonkey.agentspaces.api.space ConflictStrategyType)
            (ai.badmonkey.agentspaces.api.ad CredentialRevocation CredentialRevocation$Target)
@@ -496,11 +504,117 @@
 
 ;; ----------------------------------------------------------------- start
 
+;; ------------------------------------------------- facade and capabilities
+
+(defn- build-facade
+  "The AgentSpaces facade over this peer's one group (the starter's shape):
+  agents bind through it, typed clients resolve from it, and the
+  capabilities the annotations need are registered on it. Present always;
+  cheap when unused."
+  [config ^PeerIdentity identity agents ^GroupRuntime runtime discovery spaces agent-name codec]
+  (let [facade (AgentSpaces. identity (InstantSource/system)
+                             (reify AgentIdentityFactory
+                               (identityFor [_ agent-name] (agents agent-name))))
+        group-name (get-in config [:group :name])
+        ^AgentSpaces$GroupContext group (.register facade group-name (.id runtime) runtime discovery)]
+    (when discovery
+      (.capabilities group (CapabilityRuntime. runtime discovery identity)))
+    (doseq [[space-name ^ReplicatedSpace space] spaces]
+      (.space group ^String space-name space (.agent identity ^String agent-name)))
+    {:facade facade :group group}))
+
+(defn- ->peer-ids ^java.util.List [members]
+  (mapv #(core/peer-id %) members))
+
+(defn- build-capabilities
+  "The `:capabilities` block, each key one layer-4 service registered on the
+  facade's group so `agents/bind!` finds it and the typed clients resolve:
+
+    :vote      {:space \"votes\"}                 VoteCapability over that space
+    :aggregate true                              PushSumAggregate
+    :ordered   {:space \"orders\" :members [peer-ids] :seed 1}
+                                                 the Raft log over the members and
+                                                 the ORDERED take coordinator on that space
+    :semantic  true                              SemanticDiscovery (hashing embedder)
+    :learn     true                              GossipLearning (weight averaging)
+    :learn     {:metrics \"metrics\" :metrics-lease \"1h\"}
+                                                 the same, writing each `end-epoch!`
+                                                 evaluation into that space (default
+                                                 lease 1h); without it `end-epoch!` throws
+
+  Returns a map of the provider instances by key. Needs a discovery service,
+  which `:capabilities` switches on."
+  [{:keys [capabilities] :as config} {:keys [^AgentSpaces$GroupContext group]}
+   ^GroupRuntime runtime ^PeerIdentity identity discovery ^CborCodec codec spaces]
+  (when (seq capabilities)
+    (when-not discovery
+      (throw (ex-info ":capabilities needs a discovery service" {:capabilities capabilities})))
+    (let [pipes (.pipes group)
+          clock (InstantSource/system)
+          agent-name (or (get-in config [:group :agent]) "clj")
+          space-named (fn [k space-name]
+                        (or (get spaces space-name)
+                            (throw (ex-info (str ":capabilities " k " names a space this peer"
+                                                 " does not register")
+                                            {:space space-name :spaces (keys spaces)}))))
+          space-of (fn [k] (space-named k (get-in capabilities [k :space])))
+          vote (when (:vote capabilities)
+                 (let [^ReplicatedSpace votes (space-of :vote)
+                       v (VoteCapability. votes (.agent identity ^String agent-name) (.peerId identity) clock)]
+                   (.vote group ^String (get-in capabilities [:vote :space]) v)
+                   v))
+          aggregate (when (:aggregate capabilities)
+                      (let [a (PushSumAggregate. pipes (.sampler runtime) (.peerId identity) codec clock)]
+                        (.provide group a)
+                        a))
+          ordered (when (:ordered capabilities)
+                    (let [{:keys [space members seed] :or {seed 1}} (:ordered capabilities)
+                          ^ReplicatedSpace target (space-of :ordered)
+                          o (OrderedTakes/over pipes codec identity ^String agent-name
+                                               (->peer-ids members) clock (long seed) target)]
+                      (.ordered group ^String space o)
+                      o))
+          semantic (when (:semantic capabilities)
+                     (let [s (SemanticDiscovery. pipes runtime discovery (.peerId identity) codec clock (HashingEmbedder.))]
+                       (.provide group s)
+                       s))
+          learn (when-let [learn-config (:learn capabilities)]
+                  (let [{:keys [metrics metrics-lease] :or {metrics-lease "1h"}}
+                        (if (map? learn-config) learn-config {})
+                        l (if metrics
+                            (GossipLearning.
+                             (-> ^GossipLearner$Builder
+                                 (GossipLearner/builder pipes (.sampler runtime) (.peerId identity)
+                                                        codec clock WeightAveraging/INSTANCE)
+                                 (.metrics ^ReplicatedSpace (space-named :learn metrics)
+                                           (core/lease metrics-lease))
+                                 (.build)))
+                            (GossipLearning. pipes (.sampler runtime) (.peerId identity) codec clock))]
+                    (.provide group l)
+                    l))]
+      (cond-> {}
+        vote (assoc :vote vote)
+        aggregate (assoc :aggregate aggregate)
+        ordered (assoc :ordered ordered)
+        semantic (assoc :semantic semantic)
+        learn (assoc :learn learn)))))
+
 (defn start
   "Starts one peer and returns the system map {:identity :node :runtime
   :spaces :authorizer :blocks :discovery :founding :profile :transport
-  :channel-auth :config}. Config keys, all optional except `:group`; each
-  names the starter property it mirrors:
+  :channel-auth :facade :group-context :capabilities :config}. Config
+  keys, all optional except `:group`; each names the starter property it
+  mirrors:
+
+    :capabilities  {:vote {:space ..} :aggregate true
+                    :ordered {:space .. :members [..] :seed 1}
+                    :semantic true
+                    :learn true | {:metrics .. :metrics-lease ..}}: the layer-4 services this
+                   peer provides, registered on the facade so agentspaces.agents
+                   binds against them and the typed clients resolve
+                   (capabilities.*)
+    :agents        true to switch discovery on for agents bound through
+                   agentspaces.agents even with no capability
 
     :identity      a PeerIdentity to reuse
     :keystore      a directory path for a persistent identity (keystore)
@@ -595,7 +709,8 @@
           codec (CborCodec/defaultCodec)
           blocks (BlockExchange. runtime codec)
           discovery (when (or (:advertise group) (:content-key group)
-                              (:content-key-rotation group))
+                              (:content-key-rotation group) (:capabilities config)
+                              (:agents config))
                       (DiscoveryService/create runtime codec (.peerId identity)
                                                (InstantSource/system)
                                                (->roles (:roles config))))
@@ -611,12 +726,17 @@
                        (map (fn [space-config]
                               [(:name space-config) (build-space context space-config)]))
                        (:spaces group))]
-      (.startTicking node (core/duration tick))
-      {:identity identity :node node :runtime runtime :spaces spaces
-       :authorizer authorizer :blocks blocks :discovery discovery :founding founding
-       :profile profile :transport transport-instance :channel-auth channel-auth
-       :agents agents :key-ring ring :key-wrap key-wrap
-       :config config})))
+      (let [facade (build-facade config identity agents runtime discovery spaces
+                                 (or (:agent group) "clj") codec)
+            capabilities (build-capabilities config facade runtime identity discovery codec spaces)]
+        (.startTicking node (core/duration tick))
+        {:identity identity :node node :runtime runtime :spaces spaces
+         :authorizer authorizer :blocks blocks :discovery discovery :founding founding
+         :profile profile :transport transport-instance :channel-auth channel-auth
+         :agents agents :key-ring ring :key-wrap key-wrap
+         :facade (:facade facade) :group-context (:group facade)
+         :capabilities capabilities
+         :config config}))))
 
 ;; ---------------------------------------------------------------- system
 

@@ -19,8 +19,16 @@
   (:require [clojure.test :as t]
             [agentspaces.space-test]
             [agentspaces.fleet-test]
-            [agentspaces.agents-test]))
+            [agentspaces.agents-test]
+            [agentspaces.layer4-test]
+            [agentspaces.layer4-join-test]
+            [agentspaces.layer4-returns-test]
+            [agentspaces.layer4-verbs-test]
+            [agentspaces.layer4-reactions-test]
+            [agentspaces.layer4-options-test]
+            [agentspaces.capabilities-test]
+            [agentspaces.agents-card-test]))
 
 (defn -main [& _]
-  (let [result (t/run-tests 'agentspaces.space-test 'agentspaces.fleet-test 'agentspaces.agents-test)]
+  (let [result (t/run-tests (quote agentspaces.space-test) (quote agentspaces.fleet-test) (quote agentspaces.agents-test) (quote agentspaces.layer4-test) (quote agentspaces.layer4-join-test) (quote agentspaces.layer4-returns-test) (quote agentspaces.layer4-verbs-test) (quote agentspaces.layer4-reactions-test) (quote agentspaces.layer4-options-test) (quote agentspaces.capabilities-test) (quote agentspaces.agents-card-test))]
     (System/exit (if (and (zero? (:fail result)) (zero? (:error result))) 0 1))))

@@ -18,7 +18,10 @@
         ;; DiscoveryService, for `:group {:advertise true}` (space advertisements).
         ai.badmonkey.agentspaces/agentspaces-discovery {:mvn/version "0.2.0"}
         ;; GroupKeyDistributor and CapabilityRuntime, for :content-key-rotation (v0.1.13).
-        ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.2.0"}}
+        ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.2.0"}
+        ;; AgentBinder, the AgentSpaces facade, the typed clients, and remote actions:
+        ;; the programming model behind agentspaces.agents (L3L4-COVERAGE.md §6.2).
+        ai.badmonkey.agentspaces/agentspaces-agent {:mvn/version "0.2.0"}}
 
  :aliases
  {:test {:extra-paths ["test"]

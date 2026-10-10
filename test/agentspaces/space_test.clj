@@ -14,15 +14,17 @@
 
 (ns agentspaces.space-test
   "The data layer and the space verbs over a LocalSpace: maps in, maps out,
-  the :where DSL, take/complete with a result, and notify events."
+  the :where DSL, take/complete with a result, read-entries, and notify
+  events with their tags and details."
   (:require [clojure.test :refer [deftest is testing]]
             [agentspaces.core :as core]
             [agentspaces.space :as space])
-  (:import (ai.badmonkey.agentspaces.common.id AgentId PeerId)
+  (:import (ai.badmonkey.agentspaces.api.entry EntryId)
+           (ai.badmonkey.agentspaces.common.id AgentId PeerId)
            (ai.badmonkey.agentspaces.identity PeerIdentity)
            (ai.badmonkey.agentspaces.test Fixtures$FindingEntry Fixtures$TaskEntry)
            (clojure.lang ExceptionInfo)
-           (java.time Duration)))
+           (java.time Duration Instant)))
 
 (deftest durations-parse-simple-and-iso-forms
   (is (= (Duration/ofMinutes 10) (core/duration "10m")))
@@ -98,6 +100,46 @@
       (space/unsubscribe! subscription)
       (space/write! s Fixtures$FindingEntry {:topic "t" :summary "two"})
       (is (= 1 (count @events))))))
+
+(deftest read-entries-returns-the-metadata-view-of-each-match
+  (with-open [s (space/local "clj-entries")]
+    (space/write! s Fixtures$TaskEntry {:topic "eu" :priority 1} {:lease "10m" :tags {:region "eu"}})
+    (space/write! s Fixtures$TaskEntry {:topic "us" :priority 2} {:lease "10m" :tags {:region "us"}})
+    (let [entries (space/read-entries s Fixtures$TaskEntry)
+          eu (first (filter #(= "eu" (get-in % [:value :topic])) entries))]
+      (is (= 2 (count entries)))
+      (is (= #{:value :entry-id :issuer :tags :expires-at :issued} (set (keys eu))))
+      (is (= {:topic "eu" :priority 1} (:value eu)))
+      (is (= {"region" "eu"} (:tags eu)))
+      (is (instance? EntryId (:entry-id eu)))
+      (is (instance? AgentId (:issuer eu)))
+      (is (instance? Instant (:expires-at eu)))
+      (is (.isAfter ^Instant (:expires-at eu) (Instant/now)))
+      (is (some? (:issued eu)))
+      ;; read-all stays the plain value view; the two agree on the entry.
+      (is (= (mapv :value entries) (space/read-all s Fixtures$TaskEntry))))
+    (testing ":tags and :where narrow it as they narrow read-all"
+      (is (= ["us"] (mapv #(get-in % [:value :topic]) (space/read-entries s Fixtures$TaskEntry {:tags {:region "us"}}))))
+      (is (= ["eu"] (mapv #(get-in % [:value :topic]) (space/read-entries s Fixtures$TaskEntry {:where {:priority [:lt 2]}}))))
+      (is (= 1 (count (space/read-entries s Fixtures$TaskEntry {:limit 1})))))))
+
+(deftest notify-events-carry-the-entrys-tags-and-details
+  (with-open [s (space/local "clj-notify-tags")]
+    (let [events (atom [])
+          subscription (space/notify! s Fixtures$FindingEntry (fn [event] (swap! events conj event)))]
+      (space/write! s Fixtures$FindingEntry {:topic "t" :summary "tagged"} {:lease "10m" :tags {:region "eu" :tier "gold"}})
+      (is (= 1 (count @events)))
+      (let [{:keys [kind entry tags details entry-id]} (first @events)]
+        (is (= :written kind))
+        (is (= {"region" "eu" "tier" "gold"} tags))
+        (is (= {:topic "t" :summary "tagged"} entry))
+        (is (= entry (:value details)))
+        (is (= tags (:tags details)))
+        (is (= entry-id (:entry-id details)))
+        (is (instance? Instant (:expires-at details))))
+      (space/write! s Fixtures$FindingEntry {:topic "t" :summary "bare"})
+      (is (= {} (:tags (second @events))) "an untagged entry reports no tags")
+      (space/unsubscribe! subscription))))
 
 (deftest tags-fresh-and-credentials-over-a-local-space
   (with-open [s (space/local "clj-tags")]
