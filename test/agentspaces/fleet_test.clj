@@ -104,7 +104,7 @@
         (is (instance? GroupScopedAuthorizer (:authorizer a)))
         (is (instance? MembershipAuthorizer (.inner ^GroupScopedAuthorizer (:authorizer a))))
         (is (= :dev-local (:profile a)))
-        (is (= :signed (:channel-auth a))))
+        (is (= :session (:channel-auth a))))
       (finally
         (fleet/stop! b)
         (fleet/stop! a)))))
@@ -223,7 +223,9 @@
 
 (defn- pull-counter [counter]
   (reify ReconcilableState
-    (digest [_] (byte-array 0))
+    ;; Never equal between two members: since v0.1.17 a round opens with digest hashes and
+    ;; asks for no delta on a stream whose hashes match.
+    (digest [_] (.getBytes (str (java.util.UUID/randomUUID))))
     (deltaFor [_ _] (swap! counter inc) (byte-array 0))
     (applyDelta [_ _])))
 

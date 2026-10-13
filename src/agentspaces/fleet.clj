@@ -125,7 +125,9 @@
      :oidc? (.oidcAuthorization profile)
      :transport (or transport (if (.tlsTransport profile) :tls :tcp))
      :channel-auth (or channel-auth
-                       (if (.envelopeSignatureEveryHop profile) :signed :attested))}))
+                       (cond (.sessionAuthentication profile) :session
+                             (.envelopeSignatureEveryHop profile) :signed
+                             :else :attested))}))
 
 (def ^:private grant-operations
   {:raft-voter Authorizer$Operation/RAFT_VOTER
@@ -274,15 +276,20 @@
 ;; ------------------------------------------------------------------ node
 
 (defn- build-node
-  ^PeerNode [{:keys [roles require-attestation multicast revocation-validator security]}
+  ^PeerNode [{:keys [roles require-attestation multicast revocation-validator security peer-ad-interval lazy-push]}
              {:keys [channel-auth]} ^PeerIdentity identity]
   (let [^PeerNode$Builder builder
         (-> (PeerNode/builder identity)
             (.channelAuth (case channel-auth
                             :attested PeerNode$ChannelAuth/ATTESTED
+                            :session PeerNode$ChannelAuth/SESSION
                             :signed PeerNode$ChannelAuth/SIGNED))
             (.roles (->roles roles))
             (.requireAttestation (boolean require-attestation)))]
+    (when peer-ad-interval
+      (.peerAdInterval builder (core/duration peer-ad-interval)))
+    (when (some? lazy-push)
+      (.lazyPush builder (boolean lazy-push)))
     (when multicast
       (let [{:keys [group interval] :or {group "239.255.42.99:7787" interval "5s"}}
             (if (map? multicast) multicast {})]
@@ -621,6 +628,10 @@
     :bind          \"host:port\" to listen on; omit for a dial-only peer (bind)
     :roles         a set like #{:relay :rendezvous} (roles)
     :tick          protocol round period, default \"250ms\" (tick-millis)
+    :lazy-push         false to gossip with random fan-out only, instead of the
+                   self-pruning tree toward members that understand it (default true)
+    :peer-ad-interval  how often the self-advertisement is re-flooded, default
+                   \"30s\"; newcomers get it directly in between (peer-ad-interval-millis)
     :security      {:profile :dev-local|:mtls|:mtls-oidc|:zero-trust
                     :grants {:directive-issuer [peer ..] :raft-voter [..]
                              :connector-serve [..] :key-holder [..]
@@ -637,7 +648,7 @@
     :transport     :tcp or :tls (identity-endorsed channel certificates,
                    spec 5.6), or a Transport instance; overrides the profile
                    (transport.tls.enabled)
-    :channel-auth  :signed or :attested (unsigned frames over authenticated
+    :channel-auth  :signed, :attested or :session (unsigned frames over authenticated
                    channels); overrides the profile (transport.channel-auth)
     :tls           {:key-store .. :key-store-password .. :trust-store ..
                     :trust-store-password .. :crls [..] :revocation-strict}
