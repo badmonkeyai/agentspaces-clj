@@ -709,8 +709,10 @@
         transport-instance (->transport transport identity tls)]
     (when-let [token (get-in config [:security :token])]
       (.credentialHint node JoinCredentials/OIDC_HINT_KEY token))
-    (when (= :tls transport)
-      ;; Plain TCP stays available for dialing peers that advertise it.
+    (when (and (= :tls transport) (not (:require-attestation config)))
+      ;; Plain TCP stays available for dialing peers that advertise it, except on a node that
+      ;; requires attestation: such a node registers attesting bindings alone (spec 5.6, v0.1.19),
+      ;; and would refuse the tcp binding at registration.
       (.transport node (TcpTransport.)))
     (if bind
       (.listen node transport-instance bind)

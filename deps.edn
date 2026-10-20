@@ -10,23 +10,23 @@
 {:paths ["src"]
 
  :deps {org.clojure/clojure {:mvn/version "1.11.1"}
-        ai.badmonkey.agentspaces/agentspaces-common {:mvn/version "0.2.0"}
-        ai.badmonkey.agentspaces/agentspaces-api {:mvn/version "0.2.0"}
-        ai.badmonkey.agentspaces/agentspaces-identity {:mvn/version "0.2.0"}
-        ai.badmonkey.agentspaces/agentspaces-space {:mvn/version "0.2.0"}
-        ai.badmonkey.agentspaces/agentspaces-peering {:mvn/version "0.2.0"}
+        ai.badmonkey.agentspaces/agentspaces-common {:mvn/version "0.4.0"}
+        ai.badmonkey.agentspaces/agentspaces-api {:mvn/version "0.4.0"}
+        ai.badmonkey.agentspaces/agentspaces-identity {:mvn/version "0.4.0"}
+        ai.badmonkey.agentspaces/agentspaces-space {:mvn/version "0.4.0"}
+        ai.badmonkey.agentspaces/agentspaces-peering {:mvn/version "0.4.0"}
         ;; DiscoveryService, for `:group {:advertise true}` (space advertisements).
-        ai.badmonkey.agentspaces/agentspaces-discovery {:mvn/version "0.2.0"}
+        ai.badmonkey.agentspaces/agentspaces-discovery {:mvn/version "0.4.0"}
         ;; GroupKeyDistributor and CapabilityRuntime, for :content-key-rotation (v0.1.13).
-        ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.2.0"}
+        ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.4.0"}
         ;; AgentBinder, the AgentSpaces facade, the typed clients, and remote actions:
         ;; the programming model behind agentspaces.agents (L3L4-COVERAGE.md §6.2).
-        ai.badmonkey.agentspaces/agentspaces-agent {:mvn/version "0.2.0"}}
+        ai.badmonkey.agentspaces/agentspaces-agent {:mvn/version "0.4.0"}}
 
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {ai.badmonkey.agentspaces/agentspaces-test-support
-                      {:mvn/version "0.2.0"}}
+                      {:mvn/version "0.4.0"}}
          :main-opts ["-e" "(require 'agentspaces.run-tests) (agentspaces.run-tests/-main)"]}
 
   ;; The release build: clojure -T:build jar | install. See build.clj.
