@@ -40,12 +40,21 @@ clojure -T:build install   # the jar into ~/.m2, to try it from another project
 ```
 
 Maintainers release to Clojars by hand. Bump `version` in `build.clj`, run the
-suite, tag the commit `v<version>` (for example `v0.2.0`), and deploy with
-`CLOJARS_USERNAME` and `CLOJARS_PASSWORD` (a deploy token) set:
+suite, tag the commit `v<version>` (for example `v0.2.0`), and deploy:
 
 ```
 clojure -T:build:deploy deploy
 ```
+
+The deploy signs in to Clojars as `CLOJARS_USERNAME` (default `albakerbma`) with
+`CLOJARS_PASSWORD`, which must be a deploy token, not the account password. When
+`CLOJARS_PASSWORD` is unset it reads the token from `~/.clojure/token`. It stops
+before building if it finds neither. A Clojars release is immutable: a version
+can be deployed once, so run the suite first. Before the first release, the
+`ai.badmonkey.agentspaces` group must be verified at
+<https://clojars.org/verify/group> (Clojars checks the DNS TXT record
+`clojars albakerbma` on `badmonkey.ai`), and the Java artifacts the library
+depends on must already be on Maven Central at the same version.
 
 ## Developer Certificate of Origin (DCO)
 

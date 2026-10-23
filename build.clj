@@ -6,12 +6,17 @@
 ;;
 ;;   clojure -T:build jar       ; target/agentspaces-clj-<version>.jar and its pom
 ;;   clojure -T:build install   ; that jar into ~/.m2
-;;   clojure -T:build:deploy deploy   ; that jar to Clojars (CLOJARS_USERNAME, CLOJARS_PASSWORD)
+;;   clojure -T:build:deploy deploy   ; that jar to Clojars
+;;
+;; deploy signs in as CLOJARS_USERNAME (default albakerbma) with CLOJARS_PASSWORD, or,
+;; when that is unset, the Clojars deploy token in ~/.clojure/token.
 ;;
 ;; The Java dependencies (ai.badmonkey.agentspaces/agentspaces-*) resolve from
 ;; Maven Central; Clojars carries only this library.
 (ns build
-  (:require [clojure.tools.build.api :as b]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.tools.build.api :as b]))
 
 (def lib 'ai.badmonkey.agentspaces/agentspaces-clj)
 (def version "0.4.0")
@@ -37,7 +42,7 @@
     [:developer
      [:id "albaker"]
      [:name "Al Baker"]
-     [:email "ajb732@gmail.com"]
+     [:email "al@badmonkey.ai"]
      [:organization "Bad Monkey, Inc."]
      [:organizationUrl "https://badmonkey.ai"]]]
    [:issueManagement
@@ -75,12 +80,34 @@
               :jar-file jar-file :class-dir class-dir})
   (println "installed" lib version))
 
+(def ^:private clojars-user "albakerbma")
+
+(defn- token-file []
+  (io/file (System/getProperty "user.home") ".clojure" "token"))
+
+(defn- clojars-credentials
+  "The Clojars username and password (a deploy token). CLOJARS_USERNAME and
+  CLOJARS_PASSWORD win; otherwise the user is albakerbma and the token is read
+  from ~/.clojure/token. The token is never printed."
+  []
+  (let [env #(not-empty (System/getenv %))
+        file (token-file)
+        token (when (.isFile file) (not-empty (str/trim (slurp file))))]
+    {:username (or (env "CLOJARS_USERNAME") clojars-user)
+     :password (or (env "CLOJARS_PASSWORD") token
+                   (throw (ex-info (str "No Clojars token: set CLOJARS_PASSWORD or put a deploy token in "
+                                        file)
+                                   {})))}))
+
 (defn deploy
   "Builds the jar and deploys it to Clojars. Needs the :deploy alias's
-  deps-deploy on the classpath: clojure -T:build:deploy deploy."
+  deps-deploy on the classpath: clojure -T:build:deploy deploy. Clojars releases
+  are immutable, so a version can be deployed once."
   [_]
-  (jar nil)
-  ((requiring-resolve 'deps-deploy.deps-deploy/deploy)
-   {:installer :remote
-    :artifact (b/resolve-path jar-file)
-    :pom-file (b/pom-path {:lib lib :class-dir class-dir})}))
+  (let [credentials (clojars-credentials)] ; fail before building, not after
+    (jar nil)
+    ((requiring-resolve 'deps-deploy.deps-deploy/deploy)
+     {:installer :remote
+      :artifact (b/resolve-path jar-file)
+      :pom-file (b/pom-path {:lib lib :class-dir class-dir})
+      :repository {"clojars" credentials}})))
