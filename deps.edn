@@ -21,7 +21,9 @@
         ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.4.0"}
         ;; AgentBinder, the AgentSpaces facade, the typed clients, and remote actions:
         ;; the programming model behind agentspaces.agents (L3L4-COVERAGE.md §6.2).
-        ai.badmonkey.agentspaces/agentspaces-agent {:mvn/version "0.4.0"}}
+        ai.badmonkey.agentspaces/agentspaces-agent {:mvn/version "0.4.0"}
+        ;; The content swarm (srad/large-networks-bulk-data.md): `:content` in fleet/start and agentspaces.content.
+        ai.badmonkey.agentspaces/agentspaces-content {:mvn/version "0.4.0"}}
 
  :aliases
  {:test {:extra-paths ["test"]

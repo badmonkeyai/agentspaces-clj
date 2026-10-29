@@ -61,6 +61,8 @@
            (ai.badmonkey.agentspaces.identity AgentKeystore ChannelTrust FileKeystore
                                               PeerIdentity ServingCredential)
            (ai.badmonkey.agentspaces.peering.blocks BlockExchange)
+           (ai.badmonkey.agentspaces.content CompositeStore Content Content$Builder ContentPolicy ContentPolicy$SeedMode
+                                             FilePieceStore InPlaceStore MemoryPieceStore PieceStore SpacePayloads)
            (ai.badmonkey.agentspaces.peering.membership GroupMembership$Config
                                                         GroupScopedAuthorizer
                                                         MembershipAuthorizer)
@@ -435,7 +437,7 @@
 
 (defn- build-space
   ^ReplicatedSpace
-  [{:keys [runtime identity agent-name blocks discovery key-ring authorizer]}
+  [{:keys [runtime identity agent-name blocks discovery key-ring authorizer bulk escalate-above]}
    {:keys [name strategy settle bid-fn max-lease founder-lease tag-shard]
     :or {settle "200ms"} :as space-config}]
   (let [builder (-> (ReplicatedSpace/builder runtime name identity agent-name)
@@ -443,6 +445,8 @@
                     (.strategy (->strategy strategy))
                     (.blocks blocks)
                     (apply-admission authorizer space-config))]
+    (when (and bulk escalate-above (pos? (long escalate-above)))
+      (.bulk builder bulk (long escalate-above)))
     (when discovery
       (.advertise builder (reify DiscoveryPublisher
                             (publish [_ signed]
@@ -512,6 +516,75 @@
 ;; ----------------------------------------------------------------- start
 
 ;; ------------------------------------------------- facade and capabilities
+
+;; ------------------------------------------------------------- content swarm
+
+(defn- ->bytes-size
+  "A byte count from a number or a \"4MiB\" / \"256KiB\" / \"10GiB\" string."
+  [v]
+  (cond
+    (nil? v) nil
+    (number? v) (long v)
+    :else (let [[_ n unit] (re-matches #"(?i)\s*(\d+)\s*(B|KiB|MiB|GiB|KB|MB|GB)?\s*" (str v))]
+            (when-not n (throw (ex-info "not a byte size" {:value v})))
+            (* (Long/parseLong n)
+               (case (some-> ^String unit .toLowerCase) ("kib" "kb") 1024 ("mib" "mb") (* 1024 1024)
+                     ("gib" "gb") (* 1024 1024 1024) 1)))))
+
+(defn- content-store
+  "The piece store of `:content {:store {:backends [:file :memory :in-place] :path .. :quota ..}}`;
+  default one file backend under `~/.agentspaces/content/<group>`."
+  ^PieceStore [{:keys [backends path quota cache-external]
+                :or {backends [:file] cache-external false}} group-name codec]
+  (let [quota (or (->bytes-size quota) (* 10 1024 1024 1024))
+        clock (InstantSource/system)
+        dir (->path (or path (str (System/getProperty "user.home") "/.agentspaces/content/"
+                                  (.replaceAll ^String group-name "[^A-Za-z0-9._-]" "_"))))
+        built (mapv (fn [kind]
+                      (case (keyword kind)
+                        :file (FilePieceStore. dir codec clock (long quota))
+                        :memory (MemoryPieceStore. clock (long quota))
+                        :in-place (InPlaceStore.)
+                        (if (instance? PieceStore kind)
+                          kind
+                          (throw (ex-info ":content :store :backends: unknown kind" {:kind kind})))))
+                    backends)]
+    (if (= 1 (count built)) (first built) (CompositeStore. built (boolean cache-external)))))
+
+(defn- content-policy ^ContentPolicy [{:keys [seed-mode upload-bytes-per-day max-sessions max-window max-fetches]
+                                        :or {seed-mode :auto upload-bytes-per-day 0 max-sessions 16 max-window 32 max-fetches 4}}]
+  (let [mode (ContentPolicy$SeedMode/valueOf (.replace (.toUpperCase (name seed-mode)) "-" "_"))]
+    (reify ContentPolicy
+      (seedMode [_] mode)
+      (uploadBytesPerDay [_] (long (->bytes-size upload-bytes-per-day)))
+      (maxSessions [_] (int max-sessions))
+      (maxWindow [_] (int max-window))
+      (maxFetches [_] (int max-fetches)))))
+
+(defn- build-content
+  "The `:content` block (srad/large-networks-bulk-data.md §7.2): the content
+  space, the store, the policy, and the capability over the facade's pipes.
+  Returns {:content Content :space ReplicatedSpace :bulk SpacePayloads
+  :escalate-above n}, or nil without the block."
+  [config {:keys [^AgentSpaces$GroupContext group]} context ^GroupRuntime runtime ^PeerIdentity identity
+   authorizer ^CborCodec codec]
+  (when-let [content-config (let [c (:content config)] (cond (map? c) c (true? c) {} :else nil))]
+    (when-not (.capabilities group)
+      (throw (ex-info ":content needs a discovery service; set :agents true or any :capabilities" {})))
+    (let [{:keys [space escalate-above holding-lease] :or {space "content" escalate-above "4MiB" holding-lease "5m"}} content-config
+          content-space (build-space context {:name space :settle "200ms"})
+          store (content-store (:store content-config) (get-in config [:group :name]) codec)
+          builder (-> (Content/builder (.pipes group) runtime content-space (.peerId identity))
+                      (.codec codec)
+                      (.store store)
+                      (.blocks ^BlockExchange (:blocks context))
+                      (.policy (content-policy content-config))
+                      (.holdingLease (core/lease holding-lease)))]
+      (when-let [ring (:key-ring context)] (.keyRing ^Content$Builder builder ring))
+      (when authorizer (.authorizer ^Content$Builder builder authorizer))
+      (let [content (.build ^Content$Builder builder)]
+        {:content content :space content-space :bulk (SpacePayloads. content)
+         :escalate-above (->bytes-size escalate-above)}))))
 
 (defn- build-facade
   "The AgentSpaces facade over this peer's one group (the starter's shape):
@@ -622,6 +695,15 @@
                    (capabilities.*)
     :agents        true to switch discovery on for agents bound through
                    agentspaces.agents even with no capability
+    :content       true or {:space \"content\" :escalate-above \"4MiB\"
+                    :piece-size \"1MiB\" :seed-mode :auto :holding-lease \"5m\"
+                    :max-sessions 16 :max-window 32 :max-fetches 4
+                    :upload-bytes-per-day 0
+                    :store {:backends [:file] :path .. :quota \"10GiB\" :cache-external false}}:
+                   the content swarm (aspace:cap/content-swarm) with its space,
+                   store and policy; every application space escalates a payload
+                   above :escalate-above to it (agentspaces.content.*,
+                   srad/large-networks-bulk-data.md)
 
     :identity      a PeerIdentity to reuse
     :keystore      a directory path for a persistent identity (keystore)
@@ -723,7 +805,7 @@
           blocks (BlockExchange. runtime codec)
           discovery (when (or (:advertise group) (:content-key group)
                               (:content-key-rotation group) (:capabilities config)
-                              (:agents config))
+                              (:agents config) (:content config))
                       (DiscoveryService/create runtime codec (.peerId identity)
                                                (InstantSource/system)
                                                (->roles (:roles config))))
@@ -735,13 +817,25 @@
                    :blocks blocks :discovery discovery
                    :key-ring ring
                    :authorizer authorizer}
+          agent-name (or (:agent group) "clj")
+          ;; The facade first, with no spaces yet: the content swarm needs its pipes and
+          ;; every application space needs the swarm as its escalation seam (LB-E-02).
+          facade (build-facade config identity agents runtime discovery {} agent-name codec)
+          content (build-content config facade context runtime identity authorizer codec)
+          context (cond-> context
+                    content (assoc :bulk (:bulk content) :escalate-above (:escalate-above content)))
           spaces (into {}
                        (map (fn [space-config]
                               [(:name space-config) (build-space context space-config)]))
                        (:spaces group))]
-      (let [facade (build-facade config identity agents runtime discovery spaces
-                                 (or (:agent group) "clj") codec)
-            capabilities (build-capabilities config facade runtime identity discovery codec spaces)]
+      (doseq [[space-name ^ReplicatedSpace s] spaces]
+        (.space ^AgentSpaces$GroupContext (:group facade) ^String space-name s
+                (.agent identity ^String agent-name)))
+      (let [capabilities (build-capabilities config facade runtime identity discovery codec spaces)
+            capabilities (if content
+                           (do (.provide ^AgentSpaces$GroupContext (:group facade) ^Content (:content content))
+                               (assoc capabilities :content (:content content)))
+                           capabilities)]
         (.startTicking node (core/duration tick))
         {:identity identity :node node :runtime runtime :spaces spaces
          :authorizer authorizer :blocks blocks :discovery discovery :founding founding
@@ -749,6 +843,7 @@
          :agents agents :key-ring ring :key-wrap key-wrap
          :facade (:facade facade) :group-context (:group facade)
          :capabilities capabilities
+         :content (:content content) :content-space (:space content)
          :config config}))))
 
 ;; ---------------------------------------------------------------- system
@@ -889,7 +984,11 @@
 
 (defn stop!
   "Closes the system's spaces and node. Idempotent enough for shutdown hooks."
-  [{:keys [^PeerNode node spaces]}]
+  [{:keys [^PeerNode node spaces ^Content content ^ReplicatedSpace content-space]}]
+  (when content
+    (try (.close content) (catch Exception _)))
+  (when content-space
+    (try (.close content-space) (catch Exception _)))
   (doseq [^ReplicatedSpace s (vals spaces)]
     (try (.close s) (catch Exception _)))
   (when node

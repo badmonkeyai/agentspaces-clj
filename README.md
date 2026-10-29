@@ -940,12 +940,29 @@ Each key registers one layer-4 service on the facade (the starter's
 | `agentspaces.semantic` | `query`, `remote-query`: cards ranked by meaning |
 | `agentspaces.learn` | `start!`, `model`, `round`, `end-epoch!` (evaluations as `{:model-id :epoch :loss :content-id}`, written into the metrics space) |
 | `agentspaces.remote` | `actions`: every foreign AgentCard's invocable actions; `invoke!`: write the input, await the correlated result |
+| `agentspaces.content` | `publish!` (a file, path or bytes; `:name`, `:attrs`, `:in-place`, `:replicate`), `fetch!` (a `Fetch` handle: `await`, `progress`, `read-bytes`, `open`, `trace`), `describe`, `list-manifests`, `share!` (the bridge into a second group), `pin!`, `stats`; switched on by `:content true` or a map (`:escalate-above`, `:piece-size`, `:seed-mode`, `:store {:backends [:file :memory :in-place] :path :quota}`), after which every space escalates a payload above the threshold to the swarm |
 
 `core/template` takes `:tags {:region "eu"}` beside `:where`, so `read-all`,
 `take!`, and `notify!` filter by tag as the Java `whereTag` does
 (`:some?` for "present, whatever the value"). The ordered log runs over a
 fixed member list, which is why `:ordered` names the members: generate the
 identities first and pass each peer the same list, as the test does.
+
+The content swarm (`srad/large-networks-bulk-data.md`) is the fourth key beside
+`:capabilities`: `:content true` gives a group a `content` space, a file store
+under `~/.agentspaces/content/<group>`, and the `aspace:cap/content-swarm`
+capability; a 3 GiB `write!` into any space becomes an artifact whose pieces
+move from every holder at once, and `content/fetch!` pulls one by its root.
+
+```clojure
+(def a (fleet/start {:content {:escalate-above "4MiB" :store {:backends [:file] :path "/var/lib/aspace"}}
+                     :group {...}}))
+(def manifest (content/publish! a (io/file "checkpoint.bin") {:name "checkpoint.bin" :attrs {:run 42}}))
+;; on another peer
+(let [fetch (content/fetch! b (:root manifest))]
+  (content/await fetch "5m")
+  (content/read-bytes fetch))
+```
 
 ## 11. Defaults and choices
 
