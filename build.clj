@@ -19,7 +19,7 @@
             [clojure.tools.build.api :as b]))
 
 (def lib 'ai.badmonkey.agentspaces/agentspaces-clj)
-(def version "0.4.0")
+(def version "0.5.0")
 (def class-dir "target/classes")
 (def jar-file (format "target/%s-%s.jar" (name lib) version))
 (def basis (delay (b/create-basis {:project "deps.edn"})))

@@ -36,7 +36,7 @@ mkdir classes && javac -d classes src/shop/*.java
 
 ```clojure
 {:paths ["classes"]
- :deps {ai.badmonkey.agentspaces/agentspaces-clj {:mvn/version "0.4.0"}}}
+ :deps {ai.badmonkey.agentspaces/agentspaces-clj {:mvn/version "0.5.0"}}}
 ```
 
 **3. Write the agent.** The hints on the parameter and the result name the entry types, and the body returns a plain map that the binder converts into a `Shipment`. `fleet/start` builds the peer, and the default `mtls` security profile secures every link.
