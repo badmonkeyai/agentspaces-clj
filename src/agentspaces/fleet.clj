@@ -33,10 +33,10 @@
   (:refer-clojure :exclude [agent])
   (:require [agentspaces.core :as core]
             [clojure.string :as str])
-  (:import (ai.badmonkey.agentspaces.api.ad GroupAdvertisement
+  (:import (ai.badmonkey.agentspaces.api.spi SchemaRegistry)
+           (ai.badmonkey.agentspaces.api.ad GroupAdvertisement
                                             GroupAdvertisement$GossipParameters
                                             GroupAdvertisement$MembershipPolicy
-                                            PeerAdvertisement$Endpoint
                                             PeerAdvertisement$PeerRole
                                             SpaceAdvertisement$Admission)
            (ai.badmonkey.agentspaces.agent AgentIdentityFactory AgentSpaces AgentSpaces$GroupContext)
@@ -50,9 +50,9 @@
            (ai.badmonkey.agentspaces.api.security SecurityProfile)
            (ai.badmonkey.agentspaces.api.space ConflictStrategyType)
            (ai.badmonkey.agentspaces.api.ad CredentialRevocation CredentialRevocation$Target)
-           (ai.badmonkey.agentspaces.api.spi AgentIdentity Authorizer Authorizer$Operation Transport)
+           (ai.badmonkey.agentspaces.api.spi AgentIdentity Authorizer Authorizer$Operation BeaconLocator
+                                             LocatePolicy MembershipValidator Transport)
            (ai.badmonkey.agentspaces.capabilities.keywrap GroupKeyDistributor RingStore)
-           (ai.badmonkey.agentspaces.capabilities.runtime CapabilityPipes CapabilityRuntime)
            (ai.badmonkey.agentspaces.common.crypto Digests GroupKeyRing)
            (ai.badmonkey.agentspaces.common.codec CborCodec)
            (ai.badmonkey.agentspaces.common.crypto GroupKey)
@@ -61,12 +61,13 @@
            (ai.badmonkey.agentspaces.identity AgentKeystore ChannelTrust FileKeystore
                                               PeerIdentity ServingCredential)
            (ai.badmonkey.agentspaces.peering.blocks BlockExchange)
+           (ai.badmonkey.agentspaces.peering.bootstrap BootstrapChain MulticastLocator SeedsLocator)
            (ai.badmonkey.agentspaces.content CompositeStore Content Content$Builder ContentPolicy ContentPolicy$SeedMode
                                              FilePieceStore InPlaceStore MemoryPieceStore PieceStore SpacePayloads)
            (ai.badmonkey.agentspaces.peering.membership GroupMembership$Config
                                                         GroupScopedAuthorizer
                                                         MembershipAuthorizer)
-           (ai.badmonkey.agentspaces.peering.node GroupFounding GroupRuntime
+           (ai.badmonkey.agentspaces.peering.node FoundingTimeoutException GroupFounding GroupRuntime
                                                   JoinCredentials PeerNode
                                                   PeerNode$Builder PeerNode$ChannelAuth
                                                   SignedGroupAdvertisement)
@@ -83,10 +84,12 @@
            (java.security.cert CertificateFactory X509Certificate X509CRL)
            (java.time Duration Instant InstantSource)
            (java.util Base64)
-           (java.util.concurrent TimeoutException)
+           (java.util.concurrent Executors ScheduledExecutorService TimeoutException TimeUnit)
            (java.util.function BiConsumer Predicate ToDoubleFunction)))
 
 (set! *warn-on-reflection* true)
+
+(def ^:private ^java.lang.System$Logger log (System/getLogger "agentspaces.fleet"))
 
 ;; -------------------------------------------------------------- identity
 
@@ -118,8 +121,9 @@
   "Resolves the effective transport and channel-auth keywords: an explicit
   `:transport` / `:channel-auth` wins, otherwise the profile decides, as the
   starter does with agentspaces.transport.* over agentspaces.security.profile.
-  With no `:security` at all the profile is :dev-local (plain TCP, signed
-  frames), which is what earlier versions of these bindings did."
+  With no `:security` at all the profile is :dev-local (plain TCP, session
+  channel auth: unsigned frames over channels a handshake authenticated),
+  which is what earlier versions of these bindings did."
   [{:keys [transport channel-auth security]}]
   (let [profile-kw (or (:profile security) :dev-local)
         ^SecurityProfile profile (->profile profile-kw)]
@@ -132,15 +136,20 @@
                              :else :attested))}))
 
 (def ^:private grant-operations
+  "The twelve operations of Authorizer.Operation, by the starter's
+  security.grants.* key."
   {:raft-voter Authorizer$Operation/RAFT_VOTER
+   :raft-client Authorizer$Operation/RAFT_CLIENT
    :directive-issuer Authorizer$Operation/DIRECTIVE_ISSUER
    :connector-serve Authorizer$Operation/CONNECTOR_SERVE
+   :connector-invoke Authorizer$Operation/CONNECTOR_INVOKE
    :key-holder Authorizer$Operation/KEY_HOLDER
+   :key-rotator Authorizer$Operation/KEY_ROTATE
    :space-write Authorizer$Operation/SPACE_WRITE
    :space-take Authorizer$Operation/SPACE_TAKE
    :vote Authorizer$Operation/VOTE
    :model-serve Authorizer$Operation/MODEL_SERVE
-   :key-rotator Authorizer$Operation/KEY_ROTATE})
+   :content-fetch Authorizer$Operation/CONTENT_FETCH})
 
 (defn- ->grants
   "agentspaces.security.grants.*: {:directive-issuer [peer ..] ..} to
@@ -261,13 +270,6 @@
     :tls (tls-transport identity tls)
     transport))
 
-(defn- ->endpoint ^PeerAdvertisement$Endpoint [seed default-scheme priority]
-  (let [seed (str/trim seed)
-        [scheme address] (if-let [i (str/index-of seed "://")]
-                           [(subs seed 0 i) (subs seed (+ i 3))]
-                           [default-scheme seed])]
-    (PeerAdvertisement$Endpoint. scheme address (int priority))))
-
 (defn- ->socket-address ^InetSocketAddress [host-port]
   (let [s (str/trim host-port)
         i (str/last-index-of s ":")]
@@ -324,29 +326,74 @@
 (defn- group-advertisement
   "The literal-id advertisement of a fleet whose members share configuration:
   every member derives the same GroupId from `:founding` (the group name when
-  absent)."
-  ^GroupAdvertisement [{:keys [name founding strategy]}]
+  absent). Under `:policy :open` (the default) the issuer is a throwaway, as
+  in the starter: nobody is the founder of an open group. Under
+  `:policy :invite` the issuer is the founder whose credentials admit: the
+  peer `:founder` names, or this peer when unset."
+  ^GroupAdvertisement [{:keys [name founding strategy policy founder join-credential]} ^PeerIdentity identity]
   (let [group-id (GroupId/fromFounding (.getBytes (str (or founding name))
-                                                  StandardCharsets/UTF_8))]
+                                                  StandardCharsets/UTF_8))
+        policy (->policy policy)
+        issuer (if (= GroupAdvertisement$MembershipPolicy/INVITE policy)
+                 (do (when (and join-credential (not founder))
+                       (throw (ex-info (str "group '" name "' presents a :join-credential but names"
+                                            " no :founder: set :founder to the PeerId that issued it,"
+                                            " or every member admits against a different founder")
+                                       {:group name})))
+                     (if founder (core/peer-id founder) (.peerId identity)))
+                 (.peerId (PeerIdentity/generate)))]
     (GroupAdvertisement. (str "aspace://" (.value group-id))
-                         (.peerId (PeerIdentity/generate))
+                         issuer
                          group-id Instant/EPOCH (Duration/ofDays 365)
-                         name GroupAdvertisement$MembershipPolicy/OPEN
+                         name policy
                          (->strategy strategy)
                          (GroupAdvertisement$GossipParameters/defaults))))
+
+(defonce ^:private membership-alias-warned (atom false))
+
+(defn- membership-tuning
+  "The SWIM tuning map: `:membership-tuning`, or the deprecated `:membership`
+  alias, which still works and logs one warning per process (the starter
+  and the Groovy DSL use `membership` for the open/invite policy, which is
+  `:policy` here)."
+  [{:keys [membership-tuning membership name]}]
+  (when (and membership (not membership-tuning)
+             (compare-and-set! membership-alias-warned false true))
+    (.log log java.lang.System$Logger$Level/WARNING
+          ^String (str "group '" name "': :membership is deprecated for SWIM tuning; use"
+                       " :membership-tuning {:ttl :probe :indirect} (the membership policy"
+                       " is :policy #{:open :invite})")))
+  (or membership-tuning membership))
 
 (defn- membership-config ^GroupMembership$Config
   [{:keys [ttl probe indirect] :or {ttl "30s" probe "2s" indirect 2}}]
   (GroupMembership$Config. (core/duration ttl) (core/duration probe) (int indirect)))
 
-(defn- ->group-id ^GroupId [join]
-  (if (instance? GroupId join) join (GroupId/of (.value (core/peer-id join)))))
+(defn- ->group-id
+  "A GroupId from an instance, an \"aspace://<id>\" URI, or the bare id."
+  ^GroupId [join]
+  (if (instance? GroupId join)
+    join
+    (let [s (str/trim (str join))
+          s (if (str/starts-with? s GroupFounding/URI_PREFIX)
+              (subs s (count GroupFounding/URI_PREFIX))
+              s)]
+      (GroupId/of s))))
+
+(defn- locatable?
+  "Whether the join's bootstrap chain has anything to ask (the starter's
+  `canLocate` rule): a seed, a `:locators` entry, or the multicast beacon."
+  [{:keys [seeds locators]} multicast]
+  (boolean (or (some #(not (str/blank? (str %))) seeds)
+               (seq locators)
+               multicast)))
 
 (defn- validate-group
   "The starter's fail-fast checks, before any port is bound: `:group` is
-  required, `:join` excludes `:founding` and `:found`, and `:join` needs
-  seeds to fetch the founding advertisement from."
-  [{:keys [name join found founding seeds] :as group}]
+  required, `:join` excludes `:founding` and `:found`, `:policy` is `:open`
+  or `:invite`, and `:join` needs a bootstrap chain with something to ask
+  (seeds, `:locators`, or `:multicast`)."
+  [{:keys [name join found founding policy locators] :as group} multicast]
   (when-not (map? group)
     (throw (ex-info "fleet/start needs a :group map" {:group group})))
   (when (and join (or founding found))
@@ -354,42 +401,99 @@
                          " :found; a group is joined by id, founded, or derived,"
                          " not two of those")
                     {:group (dissoc group :spaces)})))
-  (when (and join (empty? seeds))
-    (throw (ex-info (str "group '" name "' joins by GroupId but configures no"
-                         " seeds to fetch the founding advertisement from")
+  (when-not (contains? #{nil :open :invite} policy)
+    (throw (ex-info (str "group '" name "': :policy must be :open or :invite, not " (pr-str policy))
+                    {:policy policy})))
+  (when-not (every? #(instance? BeaconLocator %) locators)
+    (throw (ex-info (str "group '" name "': :locators must hold BeaconLocator instances")
+                    {:locators locators})))
+  (when (and join (not (locatable? group multicast)))
+    (throw (ex-info (str "group '" name "' joins by GroupId but its bootstrap chain has"
+                         " nothing to ask: seeds (none configured). Set :seeds, add a"
+                         " BeaconLocator under :locators, or switch on :multicast")
                     {:join join})))
   group)
 
+(defn- locate-policy
+  "The `:bootstrap` block as the chain's LocatePolicy: `:refresh-min` and
+  `:refresh-max` pace the re-asks, `:require` refuses an empty first answer,
+  `:trace` logs each locator's answer (bootstrap.*)."
+  ^LocatePolicy [{:keys [refresh-min refresh-max require trace]}]
+  (-> (LocatePolicy/of (some-> refresh-min core/duration) (some-> refresh-max core/duration))
+      (.withRequire (boolean require))
+      (.withTrace (boolean trace))))
+
+(defn- bootstrap-chain
+  "The locator the node joins with, composed as the starter composes it: the
+  seeds first, then every `:locators` instance in order, then the multicast
+  beacon when `:multicast` is on; `:bootstrap {:first-wins :timeout}` shape
+  the chain itself."
+  ^BeaconLocator [^PeerNode node {:keys [seeds locators bootstrap]} multicast]
+  (let [{:keys [first-wins timeout]} bootstrap
+        builder (-> (BootstrapChain/builder)
+                    (.add (SeedsLocator/of (vec (or seeds []))))
+                    (.addAll (vec (or locators [])))
+                    (.locatePolicy (locate-policy bootstrap)))]
+    (when multicast (.add builder (MulticastLocator. node)))
+    (when first-wins (.firstWins builder))
+    (when timeout (.timeout builder (core/duration timeout)))
+    (.build builder)))
+
+(defn- membership-hints
+  "The `aspace:join` resource hint from `:join-credential`, or none (the
+  starter's membershipHints)."
+  ^java.util.Map [{:keys [join-credential]}]
+  (if (str/blank? (str join-credential))
+    {}
+    {JoinCredentials/HINT_KEY (str/trim (str join-credential))}))
+
 (defn- join-group
   "Joins the configured group one of three ways, mutually exclusive as in
-  the starter: `:join` fetches and verifies the founding document from the
-  seeds; `:found` founds (true) or joins with (an instance) a self-certifying
-  advertisement; otherwise `:founding`/`:name` derive a literal id locally.
-  Returns [runtime signed-founding-or-nil]."
+  the starter: `:join` fetches and verifies the founding document through
+  the bootstrap chain; `:found` founds (true) or joins with (an instance) a
+  self-certifying advertisement; otherwise `:founding`/`:name` derive a
+  literal id locally. Every way joins through the same chain and presents
+  the same `:join-credential`. Returns [runtime signed-founding-or-nil]."
   [^PeerNode node ^PeerIdentity identity
-   {:keys [name join found seeds join-timeout membership] :or {join-timeout "10s"} :as group}
-   scheme]
-  (let [^java.util.List endpoints (mapv #(->endpoint %2 scheme %1) (range) seeds)
-        config (membership-config membership)]
+   {:keys [name join found seeds join-timeout] :or {join-timeout "10s"} :as group}
+   multicast]
+  (let [config (membership-config (membership-tuning group))
+        locator (bootstrap-chain node group multicast)
+        hints (membership-hints group)
+        ^MembershipValidator validator nil
+        ^String group-name name]
     (cond
       join
       (let [group-id (->group-id join)]
         (try
-          [(.joinGroup node group-id config endpoints (core/duration join-timeout)) nil]
+          [(.joinGroup node group-id config locator (core/duration join-timeout) hints validator group-name)
+           nil]
+          (catch FoundingTimeoutException e
+            (throw (ex-info (str "group '" name "': " (.getMessage e)
+                                 (when (pos? (.connected e))
+                                   (str ". A group started from a :founding text has no signed"
+                                        " founding and cannot be joined by id; the seed must hold"
+                                        " the group's signed founding (:found) or have joined by id itself")))
+                            {:join join :seeds seeds :timeout join-timeout
+                             :locates (.locates e) :dialed (.dialed e) :connected (.connected e)
+                             :message (.getMessage e)}
+                            e)))
           (catch TimeoutException e
             (throw (ex-info (str "group '" name "': no seed served a verified founding"
                                  " advertisement for " group-id " within " join-timeout)
-                            {:join join :seeds seeds} e)))))
+                            {:join join :seeds seeds :timeout join-timeout :message (.getMessage e)}
+                            e)))))
 
       found
       (let [^SignedGroupAdvertisement signed
             (if (instance? SignedGroupAdvertisement found)
               found
               (found-group identity group))]
-        [(.joinGroup node signed config endpoints) signed])
+        [(.joinGroup node signed config locator hints validator group-name) signed])
 
       :else
-      [(.joinGroup node (group-advertisement group) config endpoints) nil])))
+      [(.joinGroup node (group-advertisement group identity) config locator hints validator group-name)
+       nil])))
 
 ;; ---------------------------------------------------------------- spaces
 
@@ -437,7 +541,7 @@
 
 (defn- build-space
   ^ReplicatedSpace
-  [{:keys [runtime identity agent-name blocks discovery key-ring authorizer bulk escalate-above]}
+  [{:keys [runtime identity agent-name blocks discovery key-ring authorizer bulk escalate-above schema-registry]}
    {:keys [name strategy settle bid-fn max-lease founder-lease tag-shard]
     :or {settle "200ms"} :as space-config}]
   (let [builder (-> (ReplicatedSpace/builder runtime name identity agent-name)
@@ -445,6 +549,7 @@
                     (.strategy (->strategy strategy))
                     (.blocks blocks)
                     (apply-admission authorizer space-config))]
+    (when schema-registry (.schemaRegistry builder ^SchemaRegistry schema-registry))
     (when (and bulk escalate-above (pos? (long escalate-above)))
       (.bulk builder bulk (long escalate-above)))
     (when discovery
@@ -513,10 +618,6 @@
         (.register (CapabilityRuntime. runtime discovery identity) keys)
         keys))))
 
-;; ----------------------------------------------------------------- start
-
-;; ------------------------------------------------- facade and capabilities
-
 ;; ------------------------------------------------------------- content swarm
 
 (defn- ->bytes-size
@@ -569,8 +670,8 @@
   [config {:keys [^AgentSpaces$GroupContext group]} context ^GroupRuntime runtime ^PeerIdentity identity
    authorizer ^CborCodec codec]
   (when-let [content-config (let [c (:content config)] (cond (map? c) c (true? c) {} :else nil))]
-    (when-not (.capabilities group)
-      (throw (ex-info ":content needs a discovery service; set :agents true or any :capabilities" {})))
+    ;; `start` switches discovery on whenever :content is set, so the facade's group holds
+    ;; the capability runtime the swarm registers with.
     (let [{:keys [space escalate-above holding-lease] :or {space "content" escalate-above "4MiB" holding-lease "5m"}} content-config
           content-space (build-space context {:name space :settle "200ms"})
           store (content-store (:store content-config) (get-in config [:group :name]) codec)
@@ -586,21 +687,23 @@
         {:content content :space content-space :bulk (SpacePayloads. content)
          :escalate-above (->bytes-size escalate-above)}))))
 
+;; ------------------------------------------------- facade and capabilities
+
 (defn- build-facade
   "The AgentSpaces facade over this peer's one group (the starter's shape):
   agents bind through it, typed clients resolve from it, and the
   capabilities the annotations need are registered on it. Present always;
-  cheap when unused."
-  [config ^PeerIdentity identity agents ^GroupRuntime runtime discovery spaces agent-name codec]
+  cheap when unused. `start` adds the spaces once the content swarm, which
+  needs the facade's pipes, exists."
+  [config ^PeerIdentity identity agents ^GroupRuntime runtime discovery]
   (let [facade (AgentSpaces. identity (InstantSource/system)
                              (reify AgentIdentityFactory
                                (identityFor [_ agent-name] (agents agent-name))))
+        _ (when-let [reg (:schema-registry config)] (.schemaRegistry facade ^SchemaRegistry reg))
         group-name (get-in config [:group :name])
         ^AgentSpaces$GroupContext group (.register facade group-name (.id runtime) runtime discovery)]
     (when discovery
       (.capabilities group (CapabilityRuntime. runtime discovery identity)))
-    (doseq [[space-name ^ReplicatedSpace space] spaces]
-      (.space group ^String space-name space (.agent identity ^String agent-name)))
     {:facade facade :group group}))
 
 (defn- ->peer-ids ^java.util.List [members]
@@ -622,16 +725,16 @@
                                                  evaluation into that space (default
                                                  lease 1h); without it `end-epoch!` throws
 
-  Returns a map of the provider instances by key. Needs a discovery service,
-  which `:capabilities` switches on."
-  [{:keys [capabilities] :as config} {:keys [^AgentSpaces$GroupContext group]}
-   ^GroupRuntime runtime ^PeerIdentity identity discovery ^CborCodec codec spaces]
+  Returns a map of the provider instances by key. The vote capability
+  counts and casts under the profile's authorizer, so a `:vote` grant is
+  enforced as in the starter. `start` switches discovery on whenever
+  `:capabilities` is set."
+  [{:keys [capabilities]} {:keys [^AgentSpaces$GroupContext group]}
+   ^GroupRuntime runtime ^PeerIdentity identity ^Authorizer authorizer discovery ^CborCodec codec
+   agent-name spaces]
   (when (seq capabilities)
-    (when-not discovery
-      (throw (ex-info ":capabilities needs a discovery service" {:capabilities capabilities})))
     (let [pipes (.pipes group)
           clock (InstantSource/system)
-          agent-name (or (get-in config [:group :agent]) "clj")
           space-named (fn [k space-name]
                         (or (get spaces space-name)
                             (throw (ex-info (str ":capabilities " k " names a space this peer"
@@ -640,7 +743,8 @@
           space-of (fn [k] (space-named k (get-in capabilities [k :space])))
           vote (when (:vote capabilities)
                  (let [^ReplicatedSpace votes (space-of :vote)
-                       v (VoteCapability. votes (.agent identity ^String agent-name) (.peerId identity) clock)]
+                       v (VoteCapability. votes (.agent identity ^String agent-name) (.peerId identity) clock
+                                          VoteCapability/ANY_AUTHENTICATED_ISSUER authorizer)]
                    (.vote group ^String (get-in capabilities [:vote :space]) v)
                    v))
           aggregate (when (:aggregate capabilities)
@@ -679,12 +783,35 @@
         semantic (assoc :semantic semantic)
         learn (assoc :learn learn)))))
 
+;; ---------------------------------------------------------------- start
+
+(defn- card-refresher
+  "A daemon scheduler that re-publishes every bound card and capability
+  advertisement each `period` (the starter's AgentSpacesLifecycle), so
+  neither lapses at the 15-minute card TTL; `stop!` shuts it down. A failed
+  refresh is logged and the schedule goes on."
+  ^ScheduledExecutorService [^AgentSpaces facade ^Duration period]
+  (let [scheduler (Executors/newSingleThreadScheduledExecutor
+                   (reify java.util.concurrent.ThreadFactory
+                     (newThread [_ task]
+                       (doto (Thread. ^Runnable task "agentspaces-card-refresh")
+                         (.setDaemon true)))))
+        millis (.toMillis period)]
+    (.scheduleAtFixedRate scheduler
+                          (fn []
+                            (try (.refreshCards facade)
+                                 (catch RuntimeException e
+                                   (.log log java.lang.System$Logger$Level/WARNING
+                                         "card refresh failed" ^Throwable e))))
+                          millis millis TimeUnit/MILLISECONDS)
+    scheduler))
+
 (defn start
   "Starts one peer and returns the system map {:identity :node :runtime
   :spaces :authorizer :blocks :discovery :founding :profile :transport
-  :channel-auth :facade :group-context :capabilities :config}. Config
-  keys, all optional except `:group`; each names the starter property it
-  mirrors:
+  :channel-auth :facade :group-context :capabilities :card-refresher
+  :config}. Config keys, all optional except `:group`; each names the
+  starter property it mirrors:
 
     :capabilities  {:vote {:space ..} :aggregate true
                     :ordered {:space .. :members [..] :seed 1}
@@ -693,8 +820,14 @@
                    peer provides, registered on the facade so agentspaces.agents
                    binds against them and the typed clients resolve
                    (capabilities.*)
+    :schema-registry a SchemaRegistry every space and the facade use instead of
+                   the default class-name registry, e.g. a NamespaceSchemaRegistry
+                   naming records by IRI (schema-registry)
     :agents        true to switch discovery on for agents bound through
                    agentspaces.agents even with no capability
+    :card-refresh  how often every bound agent's card and every capability
+                   advertisement is re-published, default \"5m\", inside the
+                   15-minute card TTL (card-refresh-millis)
     :content       true or {:space \"content\" :escalate-above \"4MiB\"
                     :piece-size \"1MiB\" :seed-mode :auto :holding-lease \"5m\"
                     :max-sessions 16 :max-window 32 :max-fetches 4
@@ -715,16 +848,18 @@
     :peer-ad-interval  how often the self-advertisement is re-flooded, default
                    \"30s\"; newcomers get it directly in between (peer-ad-interval-millis)
     :security      {:profile :dev-local|:mtls|:mtls-oidc|:zero-trust
-                    :grants {:directive-issuer [peer ..] :raft-voter [..]
-                             :connector-serve [..] :key-holder [..]
+                    :grants {:raft-voter [peer ..] :raft-client [..]
+                             :directive-issuer [..]
+                             :connector-serve [..] :connector-invoke [..]
+                             :key-holder [..] :key-rotator [..]
                              :space-write [..] :space-take [..]
-                             :vote [..] :model-serve [..]}
+                             :vote [..] :model-serve [..] :content-fetch [..]}
                     :authorizer <Authorizer>      ; required under the OIDC profiles
                     :token \"<jwt>\"                ; this node's aspace:oidc hint
                     :on-credential-hints (fn [peer-id hints])}
                    (security.profile, security.grants.*, security.oidc.token).
                    The profile picks the transport and channel-auth defaults
-                   like the starter: :dev-local is tcp + signed, :mtls is
+                   like the starter: :dev-local is tcp + session, :mtls is
                    tls + attested, :mtls-oidc tls + attested, :zero-trust
                    tls + signed. Absent :security means :dev-local.
     :transport     :tcp or :tls (identity-endorsed channel certificates,
@@ -739,7 +874,8 @@
     :require-attestation  frames must arrive on a channel attested for
                    their sender; pair with :transport :tls (node builder)
     :multicast     true or {:group \"239.255.42.99:7787\" :interval \"5s\"},
-                   the LAN bootstrap beacon (multicast.*)
+                   the LAN bootstrap beacon, also asked as a join locator
+                   (multicast.*)
     :revocation-validator  a RevocationRegistry.RevocationValidator
     :agent-keys    :peer (default) or :subordinate: each agent gets a renewing,
                    peer-certified key (identity.agent-keys, v0.1.13)
@@ -750,14 +886,31 @@
     :group         {:name          the group name (groups[].name)
                     :founding      literal-id string every member derives the
                                    same GroupId from (founding); default :name
+                    :policy        :open (default) or :invite: the membership
+                                   policy of a derived or founded group; under
+                                   :invite the founder's credentials admit
+                                   (groups[].membership)
+                    :founder       the PeerId whose credentials admit to an
+                                   :invite group derived from :founding; default
+                                   this peer (groups[].founder)
+                    :join-credential  the credential this peer presents, from
+                                   JoinCredentials.issue on the founder, sent as
+                                   the aspace:join hint (groups[].join-credential)
                     :join          \"aspace://<id>\": fetch and verify the
-                                   founding document from the seeds (join)
+                                   founding document through the bootstrap
+                                   chain (join)
                     :join-timeout  default \"10s\" (join-timeout-millis)
                     :found         true to found a self-certifying group with
                                    this identity, or a SignedGroupAdvertisement
                                    to join with; see `found-group`
                     :seeds         [\"host:port\" ..] (seeds)
-                    :membership    {:ttl :probe :indirect}
+                    :locators      [BeaconLocator ..] asked after the seeds, in
+                                   order (the starter's BeaconLocator beans)
+                    :bootstrap     {:require false :refresh-min .. :refresh-max ..
+                                    :trace false :first-wins false :timeout \"3s\"}:
+                                   the chain's LocatePolicy and shape (bootstrap.*)
+                    :membership-tuning  {:ttl \"30s\" :probe \"2s\" :indirect 2}, the
+                                   SWIM settings (:membership is a deprecated alias)
                     :content-key   32 bytes, their Base64, or a GroupKey;
                                    encrypts every space (content-key)
                     :content-key-rotation  {:rotate-every :cutover-delay
@@ -770,7 +923,8 @@
                                    (groups[].content-key-rotation, v0.1.13)
                     :advertise     true publishes each space's advertisement
                                    through a DiscoveryService (starter default)
-                    :agent         the local agent name spaces write as (\"clj\")
+                    :agent         the local agent name spaces write as (\"clj\";
+                                   the starter's is \"app\")
                     :spaces [{:name :strategy :settle :bid-fn
                               :admission :group|:allowlist|:credential|:authorizer
                               :allowed-agents [\"<peerId>/<name>\" ..]
@@ -782,12 +936,11 @@
   Every space rides one BlockExchange per group, so bulk payloads travel
   content-addressed as under the starter. Seeds accept \"host:port\" (scheme
   follows the effective transport) or an explicit \"tls://\" / \"tcp://\"."
-  [{:keys [bind tick tls group] :or {tick "250ms"} :as config}]
-  (validate-group group)
+  [{:keys [bind tick tls group multicast card-refresh] :or {tick "250ms" card-refresh "5m"} :as config}]
+  (validate-group group multicast)
   (let [identity (->identity config)
         {:keys [transport channel-auth profile] :as posture} (posture config)
         node (build-node config posture identity)
-        scheme (if (keyword? transport) (name transport) (.scheme ^Transport transport))
         transport-instance (->transport transport identity tls)]
     (when-let [token (get-in config [:security :token])]
       (.credentialHint node JoinCredentials/OIDC_HINT_KEY token))
@@ -799,7 +952,7 @@
     (if bind
       (.listen node transport-instance bind)
       (.transport node transport-instance))
-    (let [[^GroupRuntime runtime founding] (join-group node identity group scheme)
+    (let [[^GroupRuntime runtime founding] (join-group node identity group multicast)
           authorizer (->authorizer config posture runtime identity)
           codec (CborCodec/defaultCodec)
           blocks (BlockExchange. runtime codec)
@@ -812,15 +965,16 @@
           agents (agent-identities config identity)
           ring (content-key-ring config group runtime codec)
           key-wrap (start-key-wrap config group runtime identity ring authorizer discovery codec)
+          agent-name (or (:agent group) "clj")
           context {:runtime runtime :identity identity
-                   :agent-name (or (:agent group) "clj")
+                   :agent-name agent-name
                    :blocks blocks :discovery discovery
                    :key-ring ring
-                   :authorizer authorizer}
-          agent-name (or (:agent group) "clj")
+                   :authorizer authorizer
+                   :schema-registry (:schema-registry config)}
           ;; The facade first, with no spaces yet: the content swarm needs its pipes and
           ;; every application space needs the swarm as its escalation seam (LB-E-02).
-          facade (build-facade config identity agents runtime discovery {} agent-name codec)
+          facade (build-facade config identity agents runtime discovery)
           content (build-content config facade context runtime identity authorizer codec)
           context (cond-> context
                     content (assoc :bulk (:bulk content) :escalate-above (:escalate-above content)))
@@ -831,7 +985,8 @@
       (doseq [[space-name ^ReplicatedSpace s] spaces]
         (.space ^AgentSpaces$GroupContext (:group facade) ^String space-name s
                 (.agent identity ^String agent-name)))
-      (let [capabilities (build-capabilities config facade runtime identity discovery codec spaces)
+      (let [capabilities (build-capabilities config facade runtime identity authorizer discovery codec
+                                             agent-name spaces)
             capabilities (if content
                            (do (.provide ^AgentSpaces$GroupContext (:group facade) ^Content (:content content))
                                (assoc capabilities :content (:content content)))
@@ -843,6 +998,7 @@
          :agents agents :key-ring ring :key-wrap key-wrap
          :facade (:facade facade) :group-context (:group facade)
          :capabilities capabilities
+         :card-refresher (card-refresher (:facade facade) (core/duration card-refresh))
          :content (:content content) :content-space (:space content)
          :config config}))))
 
@@ -949,8 +1105,6 @@
       (.revoked view (core/peer-id who))
       (.revoked view (core/agent-id who) nil))))
 
-(def ^:private ^java.lang.System$Logger log (System/getLogger "agentspaces.fleet"))
-
 (defn rotate-content-key!
   "Rotates the group's content key now (SPEC 11a.3, v0.1.13), cutting over
   after `cutover-delay` (default two gossip periods plus 30s, as the starter,
@@ -983,8 +1137,12 @@
   (.id (.advertisement ^GroupRuntime (:runtime system))))
 
 (defn stop!
-  "Closes the system's spaces and node. Idempotent enough for shutdown hooks."
-  [{:keys [^PeerNode node spaces ^Content content ^ReplicatedSpace content-space]}]
+  "Closes the system's card refresher, spaces and node. Idempotent enough
+  for shutdown hooks."
+  [{:keys [^PeerNode node spaces ^Content content ^ReplicatedSpace content-space
+           ^ScheduledExecutorService card-refresher]}]
+  (when card-refresher
+    (try (.shutdownNow card-refresher) (catch Exception _)))
   (when content
     (try (.close content) (catch Exception _)))
   (when content-space

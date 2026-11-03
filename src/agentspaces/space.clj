@@ -20,8 +20,8 @@
   Entries travel as Clojure maps against a Java record class that names the
   entry type; leases and timeouts accept duration strings (\"10m\"),
   milliseconds, or java.time.Duration. Reads and takes return maps (nil on
-  timeout); a take result carries the fabric handle under `:taken` for
-  `complete!` and `renew!`. Reads accept `:fresh true` for one anti-entropy
+  timeout); a take result carries the fabric handle in its metadata under
+  `:agentspaces/taken` (`taken` reads it) for `complete!` and `renew!`. Reads accept `:fresh true` for one anti-entropy
   pull before matching (ReplicatedSpace only; a LocalSpace ignores it), and
   `grant!`/`revoke!` issue and withdraw space credentials on a
   credential-admitted ReplicatedSpace (spec 7.5)."

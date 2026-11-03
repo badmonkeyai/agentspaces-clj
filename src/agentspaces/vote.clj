@@ -22,11 +22,23 @@
       (vote/cast! system \"release\" \"ship\")
       (vote/decision system \"release\")   ; => {:id .. :winner .. :tally {..}} or nil"
   (:require [agentspaces.core :as core])
-  (:import (ai.badmonkey.agentspaces.capabilities.vote VoteCapability VoteCapability$Decision
+  (:import (ai.badmonkey.agentspaces.api.space Lease Subscription)
+           (ai.badmonkey.agentspaces.capabilities.vote VoteCapability VoteCapability$Decision
                                                        VoteCapability$Proposal)
+           (java.util.concurrent Executors ScheduledExecutorService ScheduledFuture TimeUnit)
            (java.util.function Consumer Predicate)))
 
 (set! *warn-on-reflection* true)
+
+(def ^:private ^java.lang.System$Logger log (System/getLogger "agentspaces.vote"))
+
+(defonce ^:private ^ScheduledExecutorService renewals
+  ;; One daemon thread per process renews every on-decision! subscription at half-life.
+  (Executors/newSingleThreadScheduledExecutor
+   (reify java.util.concurrent.ThreadFactory
+     (newThread [_ task]
+       (doto (Thread. ^Runnable task "agentspaces-vote-renewals")
+         (.setDaemon true))))))
 
 (defn- capability ^VoteCapability [system]
   (or (get-in system [:capabilities :vote])
@@ -72,10 +84,33 @@
 
 (defn on-decision!
   "Calls `(f decision-map)` once per proposal whose id passes `pred` when
-  it closes; returns the subscription (close it to stop)."
+  it closes; returns the subscription (close it to stop). Options:
+  `:lease` (default \"1h\") is the subscription lease, and `:renew` (default
+  true) renews it at half-life on a daemon scheduler, so a listener outlives
+  its lease until closed; `:renew false` lets it lapse with the lease.
+
+      (vote/on-decision! system #(str/starts-with? % \"council:\") handle-decision)
+      (vote/on-decision! system (constantly true) handle-decision {:lease \"10m\" :renew false})"
   ([system f] (on-decision! system (constantly true) f))
-  ([system pred f]
-   (.onDecision (capability system)
-                (reify Predicate (test [_ id] (boolean (pred id))))
-                (reify Consumer (accept [_ d] (f (decision->map d))))
-                (core/lease "1h"))))
+  ([system pred f] (on-decision! system pred f {}))
+  ([system pred f {:keys [lease renew] :or {lease "1h" renew true}}]
+   (let [^Lease lease (core/lease lease)
+         ^Subscription inner (.onDecision (capability system)
+                                          (reify Predicate (test [_ id] (boolean (pred id))))
+                                          (reify Consumer (accept [_ d] (f (decision->map d))))
+                                          lease)
+         half (max 1 (quot (.toMillis (.duration lease)) 2))
+         ^ScheduledFuture renewal
+         (when renew
+           (.scheduleAtFixedRate renewals
+                                 (fn []
+                                   (try (.renew inner (.duration lease))
+                                        (catch RuntimeException e
+                                          (.log log java.lang.System$Logger$Level/WARNING
+                                                "on-decision! renewal failed" ^Throwable e))))
+                                 half half TimeUnit/MILLISECONDS))]
+     (reify Subscription
+       (renew [_ extension] (.renew inner extension))
+       (close [_]
+         (when renewal (.cancel renewal false))
+         (.close inner))))))

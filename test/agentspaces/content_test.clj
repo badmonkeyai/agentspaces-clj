@@ -38,7 +38,7 @@
    :group {:name group
            :founding (str group "-v1")
            :seeds (if seed-port [(str "127.0.0.1:" seed-port)] [])
-           :membership {:ttl "30s" :probe "2s" :indirect 2}
+           :membership-tuning {:ttl "30s" :probe "2s" :indirect 2}
            :spaces [{:name "work" :settle "150ms"}]}})
 
 (defn- random-bytes ^bytes [n seed]

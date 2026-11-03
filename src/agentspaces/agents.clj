@@ -14,7 +14,7 @@
 
 
 (ns agentspaces.agents
-  "The programming model, Clojure-shaped (L3L4-COVERAGE.md §6.2): `defagent`
+  "The programming model, Clojure-shaped (reviews/L3L4-COVERAGE.md §6.2): `defagent`
   writes a Java interface whose methods carry the fleet annotations as
   metadata and a constructor that reifies it, so an agent reads as a Clojure
   form and binds through the Java `AgentBinder` via the facade; nothing is
@@ -295,12 +295,15 @@
   ^AgentBinder$Bound [{:keys [^AgentSpaces facade] :as system} agent]
   (when-not facade
     (throw (ex-info "the system has no facade; start it with fleet/start" {:keys (keys system)})))
+  ;; The facade itself refuses an agent no joined group satisfies (a verb naming a space
+  ;; this peer does not register, or a capability :capabilities does not provide); the
+  ;; empty answer is left for an object that carries no agent annotations at all.
   (let [bound (.bind facade agent)]
     (when (empty? bound)
-      (throw (ex-info (str "no group of this peer satisfies " (class agent)
-                           ": a verb names a space it does not register, or a capability"
-                           " :capabilities does not provide")
-                      {:agent agent :spaces (keys (:spaces system))})))
+      (throw (ex-info (str (class agent) " carries no agent annotations: bind a defagent"
+                           " constructor's value, or an object whose class or interfaces carry"
+                           " @AgentSpec or the verb annotations")
+                      {:agent agent})))
     (first bound)))
 
 (defn unbind!

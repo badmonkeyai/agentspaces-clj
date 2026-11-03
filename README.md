@@ -32,14 +32,14 @@ public record Shipment(String orderId, String item, String by) {
 mkdir classes && javac -d classes src/shop/*.java
 ```
 
-**2. Add the library.** The bindings pull the AgentSpaces Java libraries from Maven Central. Until `agentspaces-clj` is on Clojars, point `:local/root` at a clone of this repository in place of the `:mvn/version`.
+**2. Add the library.** The bindings pull the AgentSpaces Java libraries from Maven Central. The 0.5.0 bindings are not yet on Clojars (`RELEASE-0.5.0.md` at the workspace root is the source for what is published); until they are, point `:local/root` at a clone of this repository in place of the `:mvn/version`.
 
 ```clojure
 {:paths ["classes"]
  :deps {ai.badmonkey.agentspaces/agentspaces-clj {:mvn/version "0.5.0"}}}
 ```
 
-**3. Write the agent.** The hints on the parameter and the result name the entry types, and the body returns a plain map that the binder converts into a `Shipment`. `fleet/start` builds the peer, and the default `mtls` security profile secures every link.
+**3. Write the agent.** The hints on the parameter and the result name the entry types, and the body returns a plain map that the binder converts into a `Shipment`. `fleet/start` builds the peer under the default `:dev-local` security profile, which suits one host; add `:security {:profile :mtls}` before a fleet leaves it (§4, §11).
 
 ```clojure
 (ns shop.fulfiller
@@ -94,7 +94,7 @@ from your `~/.m2` after a `mvn install` of the core when you work against an
 unreleased version.
 
 The bindings track the AgentSpaces specification,
-[SPEC v0.1.13](https://github.com/badmonkeyai/agentspaces-spec/blob/main/SPEC.md).
+[SPEC v0.1.23](https://github.com/badmonkeyai/agentspaces-spec/blob/main/SPEC.md).
 Each section below names the clause it exposes as "SPEC §", and the mapping
 table at the end names the Spring starter property each config key mirrors.
 
@@ -116,11 +116,13 @@ table at the end names the Spring starter property each config key mirrors.
 
 ## 1. Setup
 
-Add the bindings to your `deps.edn`. They are published to Clojars, and pull
-the AgentSpaces Java libraries from Maven Central:
+Add the bindings to your `deps.edn`. They pull the AgentSpaces Java
+libraries from Maven Central. The 0.5.0 bindings are not yet on Clojars
+(`RELEASE-0.5.0.md` is the source); until they are, replace the
+`:mvn/version` with a `:local/root` pointing at a clone of this repository:
 
 ```clojure
-{:deps {ai.badmonkey.agentspaces/agentspaces-clj {:mvn/version "0.2.0"}}}
+{:deps {ai.badmonkey.agentspaces/agentspaces-clj {:mvn/version "0.5.0"}}}
 ```
 
 To work on the bindings themselves, see [CONTRIBUTING.md](CONTRIBUTING.md). In
@@ -173,9 +175,10 @@ strings.
 (core/agent-id "z6Mk.../worker")         ;=> AgentId
 ```
 
-Ten namespaces carry everything. The first three are the data layer, the
+Eleven namespaces carry everything. The first three are the data layer, the
 space verbs, and the peer; `agents` is the programming model (§10.1); the
-rest each work one capability the `:capabilities` block registers (§10.2).
+rest each work one capability the `:capabilities` block or the `:content`
+block registers (§10.2).
 
 | Namespace | Carries |
 |---|---|
@@ -183,12 +186,13 @@ rest each work one capability the `:capabilities` block registers (§10.2).
 | `agentspaces.space` | `local`, `as`, `write!`, `read`, `read-all`, `read-entries`, `take!`, `taken`, `complete!`, `renew!`, `cancel!`, `notify!`, `unsubscribe!`, `grant!`, `revoke!` |
 | `agentspaces.fleet` | `start`, `stop!`, `space`, `found-group`, `peer-id`, `writer`, `agent`, `revoke!`, `revoked?`, `rotate-content-key!`, `group-uri` |
 | `agentspaces.agents` | `defagent`, `bind!`, `unbind!`, `card`, and the returns `motion`, `contribution`, `tagged`, `convert-out` |
-| `agentspaces.vote` | `propose!`, `cast!`, `proposal`, `tally`, `decision`, `on-decision!` over the vote capability |
+| `agentspaces.vote` | `propose!`, `cast!`, `proposal`, `tally`, `decision`, `on-decision!` (`{:lease :renew}`) over the vote capability |
 | `agentspaces.aggregate` | `start!`, `estimate`, `tick!`, `await-settled`, `on-estimate!` over the push-sum aggregate |
 | `agentspaces.ordered` | `take!`, `complete!`, `leader?`: the exactly-once take through the ordered log |
 | `agentspaces.semantic` | `query`, `remote-query`: the group's cards ranked by meaning, locally or across peers |
 | `agentspaces.learn` | `start!`, `model`, `round`, `end-epoch!` over gossip learning |
 | `agentspaces.remote` | `actions`, `invoke!`: a foreign card's invocable actions, called with a map |
+| `agentspaces.content` | `publish!`, `fetch!`, `await`, `progress`, `read-bytes`, `open`, `describe`, `list-manifests`, `share!`, `pin!`, `unpin!`, `stats` over the content swarm |
 
 ## 3. One peer, from a config map
 
@@ -217,19 +221,35 @@ A fuller member, showing every top-level key:
 ```clojure
 (fleet/start
   {:keystore "./peer-keys"                ; persistent identity; omit for ephemeral
+   ;; :identity a-peer-identity           ; or reuse a PeerIdentity you hold
    :bind     "0.0.0.0:7591"               ; omit to run dial-only (a NAT-restricted peer)
    :roles    #{:rendezvous}               ; or #{:relay}, or both
    :tick     "250ms"                      ; protocol round period
+   :lazy-push true                        ; the self-pruning gossip tree (false: random fan-out only)
+   :peer-ad-interval "30s"                ; how often the self-advertisement is re-flooded
+   :card-refresh "5m"                     ; how often bound cards and capability ads re-publish, §10
    :security {:profile :mtls}             ; §4 below
    :transport :tls                        ; §5 below; the profile already implies it
    :channel-auth :attested
    :tls      {:trust-store "./ca.p12"}    ; enterprise CA mode, §5
    :require-attestation true
    :multicast {:group "239.255.42.99:7787" :interval "5s"}
+   :revocation-validator nil              ; a RevocationRegistry.RevocationValidator, §5
+   :agent-keys :subordinate               ; each agent its own peer-certified key, §6
+   :agent-keystore "./agent-keys"
+   :agent-certificate-ttl "24h"
+   :agents true                           ; discovery on for bound agents, §10.1
+   :capabilities {:vote {:space "votes"}} ; the layer-4 services this peer provides, §10.2
+   :content  {:escalate-above "4MiB"}     ; the content swarm, §10.2
    :group    {:name "research"            ; §6 below
               :founding "research-fleet-v1"
+              :policy :invite                       ; or :open (default)
+              :founder "z6MkFounder..."             ; whose credentials admit, under :invite
+              :join-credential "<from JoinCredentials.issue>"
               :seeds ["tls://10.0.0.5:7590"]
-              :membership {:ttl "30s" :probe "2s" :indirect 2}
+              :locators [my-dns-locator]            ; BeaconLocators asked after the seeds
+              :bootstrap {:require false :refresh-min "2s" :refresh-max "30s" :trace false}
+              :membership-tuning {:ttl "30s" :probe "2s" :indirect 2}
               :content-key "<base64 of 32 bytes>"
               :advertise true
               :agent "worker"
@@ -253,7 +273,7 @@ exactly as `agentspaces.security.profile` does in the starter.
 
 | Profile | Transport | Channel auth | Authorizer |
 |---|---|---|---|
-| `:dev-local` | TCP | `:signed` | membership, plus grants |
+| `:dev-local` | TCP | `:session` | membership, plus grants |
 | `:mtls` | TLS with identity-endorsed certificates | `:attested` | membership, plus grants |
 | `:mtls-oidc` | TLS | `:attested` | your identity provider |
 | `:zero-trust` | TLS | `:signed` on every hop | your identity provider |
@@ -280,11 +300,16 @@ absent or empty list leaves that operation open to any member.
            :spaces [{:name "tasks"}]}})
 ```
 
-The six operations are the ones the fabric guards: `:raft-voter` (the ordered
-log), `:directive-issuer` (command and control), `:connector-serve` (data
-query results a fleet trusts), `:key-holder` (receiving the group content
-key), and `:space-write` and `:space-take` (space admission under the
-`:authorizer` rule, §7).
+The twelve operations are the ones of `Authorizer.Operation`, the ones the
+fabric guards: `:raft-voter` and `:raft-client` (the ordered log's quorum
+and its clients), `:directive-issuer` (command and control),
+`:connector-serve` and `:connector-invoke` (data query results a fleet
+trusts, and who may ask), `:key-holder` and `:key-rotator` (receiving and
+rotating the group content key), `:space-write` and `:space-take` (space
+admission under the `:authorizer` rule, §7), `:vote` (casting a ballot the
+vote capability counts, §10.2), `:model-serve` (gossip learning), and
+`:content-fetch` (pulling from the content swarm). Every member must carry
+the same grants, because each member answers from its own configuration.
 
 The authorizer is an ordinary Java object you can question yourself:
 
@@ -360,6 +385,10 @@ available for dialing peers that advertise only TCP.
 ;; Plain TCP, every frame signed.
 {:transport :tcp :channel-auth :signed}
 
+;; Plain TCP, unsigned frames over channels a session handshake authenticated
+;; (what :dev-local selects).
+{:transport :tcp :channel-auth :session}
+
 ;; TLS with identity-endorsed certificates (SPEC §5.6): the handshake proves the
 ;; peer, so frames on that link may travel without an envelope signature.
 {:transport :tls :channel-auth :attested}
@@ -411,6 +440,10 @@ introducing itself. Nothing unauthenticated is ever acted on.
 {:multicast {:group "239.255.42.99:7787" :interval "2s"}}
 ```
 
+With `:multicast` on, the beacon is also a locator in the group's bootstrap
+chain (§6), so a `:join` by id with no seeds finds its founding through the
+datagrams the beacon has heard.
+
 ### Seeds
 
 Seeds are `"host:port"` strings whose scheme follows the effective transport,
@@ -456,10 +489,11 @@ re-publish the same id with a different membership policy or strategy.
 
 ### Join by id alone
 
-A peer that knows only the URI and a seed asks the seed for the founding
-document, verifies the signature, checks that the document hashes to the id
-it was given, and only then joins. A hostile seed can stall a join; it cannot
-substitute a policy.
+A peer that knows only the URI and a way to find a member asks that member
+for the founding document, verifies the signature, checks that the document
+hashes to the id it was given, and only then joins. A hostile seed can stall
+a join; it cannot substitute a policy. `:join` accepts the `aspace://` URI
+or the bare id.
 
 ```clojure
 (fleet/start {:bind "127.0.0.1:7591"
@@ -469,17 +503,102 @@ substitute a policy.
                       :spaces [{:name "tasks"}]}})
 ```
 
-### Membership tuning
+`fleet/start` refuses a `:join` whose bootstrap chain has nothing to ask,
+before any port is bound, and the message names the three remedies: set
+`:seeds`, add a locator under `:locators`, or switch on `:multicast`. When
+the join times out, the `ex-info` carries the `FoundingTimeoutException`'s
+counts (`:locates`, `:dialed`, `:connected`) and its `:message`; with a
+connected seed that served nothing, the message adds the advice that a group
+started from a `:founding` text has no signed founding and cannot be joined
+by id (the seed must have founded with `:found` or joined by id itself).
+
+### The bootstrap chain: `:locators` and `:bootstrap`
+
+Every join goes through one `BootstrapChain`, composed as the Spring starter
+composes it: the `:seeds` first, then each `BeaconLocator` under
+`:locators` in order, then the multicast beacon when `:multicast` is on.
+The node asks the chain again while it waits (after the first answer, in
+slices of 1 s, 2 s, 4 s, then 5 s up to `:join-timeout`), so a locator that
+answers nothing at first and a member two seconds later still joins. The
+`agentspaces-bootstrap` and `agentspaces-bootstrap-dns` projects provide
+DNS, URL and Kubernetes locators; a `reify BeaconLocator` is enough for your
+own.
 
 ```clojure
-{:group {:membership {:ttl "30s"      ; a silent member lapses after this
-                      :probe "2s"     ; direct ping timeout before indirect probing
-                      :indirect 2}}}  ; how many relays to ask
+(import 'ai.badmonkey.agentspaces.api.spi.BeaconLocator
+        'ai.badmonkey.agentspaces.api.spi.BeaconHint
+        'ai.badmonkey.agentspaces.api.ad.PeerAdvertisement$Endpoint)
+
+(def registry
+  (reify BeaconLocator
+    (name [_] "registry")
+    (locate [_ request]                       ; a BeaconRequest: groupName, groupId, defaultScheme
+      (if-let [members (seq (lookup (.groupName request)))]
+        (BeaconHint/of (mapv #(PeerAdvertisement$Endpoint. "tcp" % 0) members) "registry")
+        (BeaconHint/none)))))
+
+(fleet/start {:group {:join uri
+                      :locators [registry]
+                      :bootstrap {:refresh-min "2s"     ; pace the re-asks (default the node's)
+                                  :refresh-max "30s"
+                                  :require false        ; true refuses an empty first answer at once
+                                  :trace false          ; true logs each locator's answer
+                                  :first-wins false     ; true stops at the first locator with endpoints
+                                  :timeout "3s"}        ; per locator
+                      :spaces [{:name "tasks"}]}})
+```
+
+`:bootstrap` mirrors the starter's `agentspaces.bootstrap.*`: `:refresh-min`,
+`:refresh-max`, `:require` and `:trace` become the chain's `LocatePolicy`;
+`:first-wins` and `:timeout` shape the chain itself.
+
+### Membership policy: `:policy`, `:founder`, `:join-credential`
+
+A derived or founded group is `:open` by default: any peer that verifies the
+advertisement is admitted. Under `:policy :invite` a peer is admitted only
+with a join credential the founder issued for its PeerId, presented as the
+`aspace:join` hint (SPEC §5.1). For a group derived from `:founding`, the
+founder is the peer `:founder` names, or this peer when unset; a found group
+(`:found`) has its signer as founder. The starter's `membership` property is
+this `:policy`.
+
+```clojure
+;; The founder: an invite group derived from a text.
+(def founder (fleet/start {:bind "127.0.0.1:7590" :identity founder-identity
+                           :group {:name "research" :founding "research-v1" :policy :invite
+                                   :spaces [{:name "tasks"}]}}))
+
+;; Issue a credential for a guest's PeerId (the Java way to mint one).
+(import 'ai.badmonkey.agentspaces.peering.node.JoinCredentials)
+(def credential (JoinCredentials/issue founder-identity (.id (:runtime founder)) guest-peer-id))
+
+;; The guest presents it; a peer without one is never admitted.
+(fleet/start {:bind "127.0.0.1:7591" :identity guest-identity
+              :group {:name "research" :founding "research-v1" :policy :invite
+                      :founder (fleet/peer-id founder)
+                      :join-credential credential
+                      :seeds ["127.0.0.1:7590"]
+                      :spaces [{:name "tasks"}]}})
+```
+
+A `:join-credential` on a derived `:invite` group needs `:founder`, because
+every member admits against the founder it names; `fleet/start` refuses the
+pair otherwise. `fleet/revoke!` with `{:kind :join-credential}` withdraws one
+(§6, agents of their own).
+
+### Membership tuning: `:membership-tuning`
+
+```clojure
+{:group {:membership-tuning {:ttl "30s"      ; a silent member lapses after this
+                             :probe "2s"     ; direct ping timeout before indirect probing
+                             :indirect 2}}}  ; how many relays to ask
 ```
 
 If you partition peers in a test for several seconds, lengthen these; a peer
 that evicts its partner during the partition has nobody to re-introduce
-itself to afterwards.
+itself to afterwards. `:membership` is the deprecated alias for this map:
+it still works and logs one warning per process. The starter and the Groovy
+DSL use `membership` for the open/invite policy, which is `:policy` here.
 
 ### Content keys
 
@@ -787,9 +906,12 @@ need the raw object.
 | `:spaces` | name to `ReplicatedSpace`; `(fleet/space system "tasks")` |
 | `:authorizer` | the profile's `Authorizer` (§4) |
 | `:blocks` | the group's `BlockExchange` |
-| `:discovery` | the `DiscoveryService`, when `:advertise`, `:agents`, or `:capabilities` is set |
+| `:discovery` | the `DiscoveryService`, when `:advertise`, `:agents`, `:capabilities`, `:content`, `:content-key`, or `:content-key-rotation` is set |
 | `:facade` `:group-context` | the `AgentSpaces` facade and this group's context: agents bind through them |
 | `:capabilities` | the layer-4 providers the `:capabilities` block registered, by key |
+| `:card-refresher` | the daemon scheduler that re-publishes bound cards and capability advertisements every `:card-refresh` (default `"5m"`); `fleet/stop!` shuts it down |
+| `:content` `:content-space` | the content swarm and its space, under `:content` |
+| `:key-ring` `:key-wrap` | the group's content-key ring and its distributor, under `:content-key` |
 | `:founding` | the `SignedGroupAdvertisement`, when this node founded the group |
 | `:profile` `:transport` `:channel-auth` | the effective posture |
 | `:config` | the map you passed |
@@ -913,6 +1035,13 @@ element, both keyed by `:key`:
     (Fixtures$FindingEntry. (:topic task) (str (+ (if acc (parse-long (:summary acc)) 0) (:priority task))))))
 ```
 
+**Card refresh.** A bound card and a capability advertisement are leased
+for fifteen minutes. `fleet/start` re-publishes both every `:card-refresh`
+(default `"5m"`, the starter's `card-refresh-millis`) on a daemon thread, so
+a long-lived peer stays discoverable; `fleet/stop!` shuts the scheduler
+down. A test can set `{:card-refresh "200ms"}` and watch the card's
+`issued` advance in the discovery cache.
+
 ### 10.2 Capabilities: the `:capabilities` block and its namespaces
 
 ```clojure
@@ -934,7 +1063,7 @@ Each key registers one layer-4 service on the facade (the starter's
 
 | Namespace | What it does |
 |---|---|
-| `agentspaces.vote` | `propose!` (idempotent on the id), `cast!`, `proposal`, `tally`, `decision`, `on-decision!` |
+| `agentspaces.vote` | `propose!` (idempotent on the id), `cast!` (refused for a peer the `:vote` grant leaves out, as every member's tally would drop its ballot), `proposal`, `tally`, `decision`, `on-decision!` (`{:lease "1h" :renew true}`: the subscription renews at half-life until closed) |
 | `agentspaces.aggregate` | `start!` (`:mode` `:avg`, `:sum`, `:count`, `:min`, `:max`), `estimate`, `await-settled` (`{:ticks :tolerance :timeout}`), `on-estimate!` |
 | `agentspaces.ordered` | `take!` through the log (exactly once across the members), `complete!`, `leader?` |
 | `agentspaces.semantic` | `query`, `remote-query`: cards ranked by meaning |
@@ -999,8 +1128,16 @@ and `fleet/writer` unambiguous.
 
 **A TLS node also listens on plain TCP for dialing.** As under the starter, a
 `:tls` node registers a `TcpTransport` too, so it can dial peers that
-advertise only TCP endpoints. Under `:require-attestation` those peers never
-attest and are refused, which is the intended posture.
+advertise only TCP endpoints. Under `:require-attestation` the plain TCP
+binding is not registered at all (such a node registers attesting bindings
+alone, SPEC §5.6), which is the intended posture.
+
+**The writer agent is `"clj"`, the starter's is `"app"`.** Every space of a
+system writes as `<peerId>/clj` by default, where a Spring Boot peer writes
+as `<peerId>/app`. The name is part of the `AgentId`, so an allowlist, a
+space credential, or a vote identity that names one does not name the other.
+Set `:group {:agent "app"}` on the Clojure side when a fleet mixes the two
+and its admission rules name the starter's agents, or name both.
 
 **Tick loops in tests advance real time.** `fleet/start` ticks the node on a
 real scheduler (`:tick`). Anti-entropy paces itself by the group's gossip
@@ -1016,29 +1153,40 @@ the bundled tests use bounded polling helpers for this.
 | `:roles` | `roles` | `#{:relay :rendezvous}` |
 | `:tick` | `tick-millis` | default `"250ms"` |
 | `:security {:profile}` | `security.profile` | default `:dev-local` here, `mtls` in the starter |
-| `:security {:grants}` | `security.grants.*` | nine operation keys (v0.1.13 adds `:key-rotator`), each a list of peer ids |
+| `:security {:grants}` | `security.grants.*` | twelve operation keys (`:raft-voter` `:raft-client` `:directive-issuer` `:connector-serve` `:connector-invoke` `:key-holder` `:key-rotator` `:space-write` `:space-take` `:vote` `:model-serve` `:content-fetch`), each a list of peer ids |
 | `:security {:authorizer}` | `security.oidc.*` | an `Authorizer` instance; required under OIDC profiles |
 | `:security {:token}` | `security.oidc.token` | this node's `aspace:oidc` hint |
 | `:security {:on-credential-hints}` | the Spring `Authorizers` hint listener | `(fn [peer-id hints])` |
 | `:transport` | `transport.tls.enabled` | `:tcp`, `:tls`, or a `Transport` |
-| `:channel-auth` | `transport.channel-auth` | `:signed` or `:attested` |
+| `:channel-auth` | `transport.channel-auth` | `:signed`, `:attested`, or `:session` |
 | `:tls {..}` | `transport.tls.{key-store, key-store-password, trust-store, trust-store-password, crls, revocation-strict}` | a trust store selects CA mode |
 | `:require-attestation` | `transport.tls.require-attestation` | pair with `:transport :tls` |
-| `:multicast` | `multicast.{enabled, group, interval-millis}` | `true` or a map |
+| `:multicast` | `multicast.{enabled, group, interval-millis}` | `true` or a map; also a join locator |
+| `:lazy-push` | `lazy-push` | default `true` |
+| `:peer-ad-interval` | `peer-ad-interval-millis` | default `"30s"` |
+| `:card-refresh` | `card-refresh-millis` | default `"5m"` |
+| `:agents` | none (the starter always creates discovery) | `true` switches discovery on for bound agents with no capability |
+| `:capabilities {..}` | `capabilities.*` | §10.2 |
+| `:content` | `content.*` | `true` or a map; §10.2 |
 | `:revocation-validator` | `PeerNode.Builder.revocationValidator` | a `RevocationValidator` |
 | `:agent-keys` | `identity.agent-keys` | `:peer` (default) or `:subordinate` (v0.1.13) |
 | `:agent-keystore` | `identity.agent-keystore` | a directory; needs `:subordinate` |
 | `:agent-certificate-ttl` | `identity.agent-certificate-ttl` | default `"24h"` |
 | `:group {:name}` | `groups[].name` | also the default founding string |
 | `:group {:founding}` | `groups[].founding` | literal-id derivation |
-| `:group {:join}` `:join-timeout` | `groups[].join`, `join-timeout-millis` | join by id; needs seeds; excludes `:founding` and `:found` |
+| `:group {:join}` `:join-timeout` | `groups[].join`, `join-timeout-millis` | join by id; needs a chain with something to ask (`:seeds`, `:locators`, or `:multicast`); excludes `:founding` and `:found` |
+| `:group {:policy}` | `groups[].membership` | `:open` (default) or `:invite` |
+| `:group {:founder}` | `groups[].founder` | the PeerId whose credentials admit under `:invite`; default this peer |
+| `:group {:join-credential}` | `groups[].join-credential` | the `aspace:join` hint, from `JoinCredentials.issue` |
+| `:group {:locators}` | `BeaconLocator` beans | a vector of `BeaconLocator` instances, asked after the seeds |
+| `:group {:bootstrap}` | `bootstrap.{require, refresh-min, refresh-max, trace}` and the chain's `firstWins`, `timeout` | the `LocatePolicy` and the chain's shape |
 | `:group {:found}` | none | `true` to found here, or a `SignedGroupAdvertisement` |
 | `:group {:seeds}` | `groups[].seeds` | `"host:port"` or `"tls://host:port"` |
-| `:group {:membership}` | membership config | `:ttl`, `:probe`, `:indirect` |
+| `:group {:membership-tuning}` | `GroupMembership.Config` | `:ttl`, `:probe`, `:indirect`; `:membership` is the deprecated alias |
 | `:group {:content-key}` | `groups[].content-key` | 32 bytes, Base64, or a `GroupKey` |
 | `:group {:content-key-rotation}` | `groups[].content-key-rotation.*` | `:rotate-every`, `:cutover-delay`, `:writer-grace` (v0.1.13) |
 | `:group {:advertise}` | starter default | publish SpaceAdvertisements |
-| `:group {:agent}` | the starter's `"app"` | local agent name, default `"clj"` |
+| `:group {:agent}` | the starter's `"app"` | local agent name, default `"clj"` (§11: set `"app"` to share admission rules with a Spring peer) |
 | `:spaces [{:name :strategy :settle :bid-fn}]` | `spaces[].{name, strategy, settle-window-millis}` | `:bid-fn` for AUCTION |
 | `:spaces [{:admission}]` | `spaces[].admission` | `:group`, `:allowlist`, `:credential`, `:authorizer` |
 | `:spaces [{:allowed-agents}]` | `spaces[].allowed-agents` | `"<peerId>/<name>"` or `AgentId` |
@@ -1048,7 +1196,7 @@ the bundled tests use bounded polling helpers for this.
 
 ## 13. Tests
 
-`clj -M:test` runs sixty-three tests. The data layer and every space verb run
+`clj -M:test` runs seventy tests. The data layer and every space verb run
 over a `LocalSpace`, `read-entries` and the tags and details on notify events
 among them; then real fleets over loopback exercise each config
 interface: a TCP take and complete round trip between two peers; an
@@ -1113,6 +1261,18 @@ annotations found untested, again over two TCP peers:
 - the card: `:certificate` and `:agent-public-key` under
   `:agent-keys :subordinate`, mirroring the raw `AgentCard`, and nil for a
   peer-signed agent.
+
+The 0.5.0 parity suite covers what the review of the bindings against the
+Spring starter found missing, over loopback peers: a peer the `:vote` grant
+leaves out is refused when it casts, and `on-decision!` fires after its 1s
+lease would have lapsed; a bound card's issue time advances on a 200 ms
+`:card-refresh` and `stop!` shuts the refresher down; a join by the bare id
+through a `:locators` locator that answers nothing the first time and a
+member the second; the refusal naming `:seeds`, `:locators`, and
+`:multicast`, the `FoundingTimeoutException` counts in the `ex-info`, and
+the advice for a seed founded from a text; an `:invite` group admitting the
+peer that presents a `:join-credential` and never the stranger, the
+credential-without-founder refusal, and the `:membership` alias.
 
 ---
 
