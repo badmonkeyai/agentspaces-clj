@@ -18,7 +18,7 @@
   `:capabilities {:semantic true}`: rank the group's cards by meaning,
   locally or across peers whose embedder matches."
   (:require [agentspaces.core :as core])
-  (:import (ai.badmonkey.agentspaces.api.ad AgentCard AssetCard)
+  (:import (ai.badmonkey.agentspaces.api.ad AgentCard AssetCard ModelCard)
            (ai.badmonkey.agentspaces.capabilities.semantic SemanticDiscovery SemanticDiscovery$Match)))
 
 (set! *warn-on-reflection* true)
@@ -34,7 +34,9 @@
       (instance? AgentCard ad) (assoc :kind :agent :name (.localName (.agent ^AgentCard ad))
                                       :description (.description ^AgentCard ad))
       (instance? AssetCard ad) (assoc :kind :asset :name (.asset ^AssetCard ad)
-                                      :description (.description ^AssetCard ad)))))
+                                      :description (.description ^AssetCard ad))
+      (instance? ModelCard ad) (assoc :kind :model :name (.name ^ModelCard ad)
+                                      :description (str (clojure.string/join " " (.tasks ^ModelCard ad)) " on " (.engine ^ModelCard ad))))))
 
 (defn query
   "Ranks the cards this peer holds against a question; `limit` default 5."
