@@ -47,6 +47,28 @@
     ^Fixtures$FindingEntry
     (Fixtures$FindingEntry. (:topic t) "filed")))
 
+(defagent Desk
+  {:description "Answers the chat"
+   :ui [{:catalog "bma-widgets" :component "ChatInput" :id "ask" :role "control" :controls ["file"] :reads true :writes true}]}
+  (take file [^Fixtures$TaskEntry t] {:space "work" :poll-timeout "200ms"}
+    ^Fixtures$FindingEntry
+    (Fixtures$FindingEntry. (:topic t) "filed")))
+
+(deftest the-card-carries-the-ui-declaration-defagent-wrote
+  ;; v0.1.26 (SPEC §6.1a.3, ISSUE-UiComponents FR-6): `:ui` on defagent is the Java binder's @UiComponent
+  (let [port (free-port)
+        a (fleet/start (config "clj-ui" port nil {}))]
+    (try
+      (let [{:keys [ui]} (agents/card (agents/bind! a (->Desk)))
+            plain (agents/card (agents/bind! a (->Clerk)))]
+        (is (= "a2ui" (:protocol ui)))
+        (is (= "v0.9.1" (:version ui)))
+        (is (= [{:id "ask" :catalog-id "bma-widgets" :component "ChatInput" :entry "" :controls ["file"] :role "control"}]
+               (:components ui)))
+        (is (= ["bma-widgets"] (:catalog-ids ui)))
+        (is (nil? (:ui plain)) "an agent without :ui carries no declaration"))
+      (finally (fleet/stop! a)))))
+
 (deftest the-card-carries-the-agent-certificate-under-subordinate-keys-and-nothing-under-peer-keys
   (let [port-a (free-port) port-b (free-port)
         a (fleet/start (config "clj-card" port-a nil {:agent-keys :subordinate :agent-certificate-ttl "2h"}))

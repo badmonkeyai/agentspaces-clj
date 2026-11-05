@@ -28,6 +28,8 @@
             [agentspaces.layer4-options-test]
             [agentspaces.capabilities-test]
             [agentspaces.content-test]
+            [agentspaces.prompts-test]
+            [agentspaces.commerce-test]
             [agentspaces.agents-card-test]
             [agentspaces.fleet-parity-test]))
 

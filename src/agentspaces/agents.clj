@@ -253,6 +253,11 @@
   there, which is what the card and remote callers read) and `->Name`, a
   constructor returning a bound-ready object.
 
+  `:ui` in the spec-map declares what the agent can show (SPEC §6.1a.3): a
+  vector of maps with `:catalog`, `:component`, and the optional `:id`,
+  `:entry` (a class), `:entry-iri`, `:controls` (action names the verbs
+  define), `:role`, `:reads`, `:writes`; the card's `:ui` carries them.
+
   Options are the annotation's attributes in kebab case; `:mode` takes
   `:local`, `:leased`, or `:ordered` on a join and `:leased` or `:ordered` on
   a reduce; `:produces [EntryClass ...]` declares what an Object return
@@ -260,9 +265,20 @@
   [name spec & forms]
   (let [iface (symbol (str name "Spec"))
         agent-name (or (:name spec) (str/lower-case (str name)))
-        spec-meta {(class-symbol AgentSpec) {'name agent-name
-                              'description (or (:description spec) "")
-                              'goals (vec (or (:goals spec) []))}}
+        ;; v0.1.26 (SPEC §6.1a.3): `:ui [{:catalog .. :component .. :id .. :entry Class :entry-iri .. :controls [..] :role .. :reads .. :writes ..} ...]`
+        ;; becomes the repeatable @UiComponent on the interface, the Java binder's seam, so the card carries `ui`
+        ui-meta (when-let [ui (seq (:ui spec))]
+                  {(class-symbol ai.badmonkey.agentspaces.agent.annotation.UiComponents)
+                   {'value (mapv (fn [m]
+                                   (list (class-symbol ai.badmonkey.agentspaces.agent.annotation.UiComponent)
+                                         (into {} (map (fn [[k v]] [(symbol (camel k))
+                                                                    (attribute-value ai.badmonkey.agentspaces.agent.annotation.UiComponent k v)]))
+                                               m)))
+                                 ui)}})
+        spec-meta (merge {(class-symbol AgentSpec) {'name agent-name
+                                                    'description (or (:description spec) "")
+                                                    'goals (vec (or (:goals spec) []))}}
+                         ui-meta)
         parsed (doall
                 (for [[verb method params opts & body] forms]
                   (let [annotation (or (get verbs verb)
@@ -340,4 +356,13 @@
      :actions (mapv (fn [^CardAction a] {:name (.name a) :kind (.kind a) :description (.description a)})
                     (.actions c))
      :agent-public-key (.agentPublicKey c)
-     :certificate (certificate->map (.agentCertificate c))}))
+     :certificate (certificate->map (.agentCertificate c))
+     ;; v0.1.26 (SPEC §6.1a.3): what the agent can show, or nil
+     :ui (when-let [u (.ui c)]
+           {:protocol (.protocol u) :version (.version u)
+            :components (mapv (fn [^ai.badmonkey.agentspaces.api.ad.UiDeclaration$Component comp]
+                                {:id (.id comp) :catalog-id (.catalogId comp) :component (.component comp)
+                                 :entry (.entry comp) :controls (vec (.controls comp)) :role (.role comp)})
+                              (.components u))
+            :entries {:reads (vec (.reads (.entries u))) :writes (vec (.writes (.entries u)))}
+            :catalog-ids (vec (.catalogIds u))})}))
