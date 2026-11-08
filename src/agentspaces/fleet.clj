@@ -32,6 +32,7 @@
       (fleet/stop! system)"
   (:refer-clojure :exclude [agent])
   (:require [agentspaces.core :as core]
+            [agentspaces.pdt :as pdt]
             [clojure.string :as str])
   (:import (ai.badmonkey.agentspaces.api.spi SchemaRegistry)
            (ai.badmonkey.agentspaces.api.ad GroupAdvertisement
@@ -64,6 +65,7 @@
            (ai.badmonkey.agentspaces.peering.bootstrap BootstrapChain MulticastLocator SeedsLocator)
            (ai.badmonkey.agentspaces.content CompositeStore Content Content$Builder ContentPolicy ContentPolicy$SeedMode
                                              FilePieceStore InPlaceStore MemoryPieceStore PieceStore SpacePayloads)
+           (ai.badmonkey.agentspaces.content.tree TreeStore)
            (ai.badmonkey.agentspaces.peering.membership GroupMembership$Config
                                                         GroupScopedAuthorizer
                                                         MembershipAuthorizer)
@@ -683,9 +685,24 @@
                       (.holdingLease (core/lease holding-lease)))]
       (when-let [ring (:key-ring context)] (.keyRing ^Content$Builder builder ring))
       (when authorizer (.authorizer ^Content$Builder builder authorizer))
+      ;; `:pdt`: the persistent data trees' node store serves and fetches trees (PD-X-03, PD-C-01).
+      (when-let [tree-store (:tree-store context)] (.treeStore ^Content$Builder builder ^TreeStore tree-store))
       (let [content (.build ^Content$Builder builder)]
         {:content content :space content-space :bulk (SpacePayloads. content)
          :escalate-above (->bytes-size escalate-above)}))))
+
+(defn- build-pdt
+  "The `:pdt` block (srad/agentspaces-pdt.md §7.2, PD-C-01): the ref space and
+  the `Pdt` facade over the node store, built before the content swarm so the
+  swarm takes the facade's tree store. Returns {:pdt Pdt :space ReplicatedSpace
+  :space-name s}, or nil without the block."
+  [config context]
+  (when-let [pdt-config (let [c (:pdt config)] (cond (map? c) c (true? c) {} :else nil))]
+    (let [space-name (or (:space pdt-config) "pdt")
+          ref-space (build-space context {:name space-name :settle "150ms"})]
+      {:pdt (pdt/build pdt-config ref-space (get-in config [:group :name]))
+       :space ref-space
+       :space-name space-name})))
 
 ;; ------------------------------------------------- facade and capabilities
 
@@ -837,6 +854,14 @@
                    store and policy; every application space escalates a payload
                    above :escalate-above to it (agentspaces.content.*,
                    srad/large-networks-bulk-data.md)
+    :pdt           true or {:space \"pdt\" :store {:kind :pack :path ..}
+                    :inline-delta \"32KiB\" :load-timeout \"10s\" :follow :full
+                    :sealing \"none\" :retain {:versions 64 :age \"1h\"}
+                    :head-lease \"10m\" :refs {\"name\" {:mode :linear}}}:
+                   persistent data trees over the content swarm (switched on
+                   when absent) with their ref space; agentspaces.pdt/ref,
+                   swap!, and the Clojure collections over PMap, PSet, and
+                   PVector (srad/agentspaces-pdt.md appendix C, PD-C-01)
 
     :identity      a PeerIdentity to reuse
     :keystore      a directory path for a persistent identity (keystore)
@@ -938,7 +963,8 @@
   follows the effective transport) or an explicit \"tls://\" / \"tcp://\"."
   [{:keys [bind tick tls group multicast card-refresh] :or {tick "250ms" card-refresh "5m"} :as config}]
   (validate-group group multicast)
-  (let [identity (->identity config)
+  (let [config (if (and (:pdt config) (not (:content config))) (assoc config :content true) config)
+        identity (->identity config)
         {:keys [transport channel-auth profile] :as posture} (posture config)
         node (build-node config posture identity)
         transport-instance (->transport transport identity tls)]
@@ -975,6 +1001,8 @@
           ;; The facade first, with no spaces yet: the content swarm needs its pipes and
           ;; every application space needs the swarm as its escalation seam (LB-E-02).
           facade (build-facade config identity agents runtime discovery)
+          pdt (build-pdt config context)
+          context (cond-> context pdt (assoc :tree-store (.treeStore ^ai.badmonkey.agentspaces.pdt.Pdt (:pdt pdt))))
           content (build-content config facade context runtime identity authorizer codec)
           context (cond-> context
                     content (assoc :bulk (:bulk content) :escalate-above (:escalate-above content)))
@@ -990,7 +1018,8 @@
             capabilities (if content
                            (do (.provide ^AgentSpaces$GroupContext (:group facade) ^Content (:content content))
                                (assoc capabilities :content (:content content)))
-                           capabilities)]
+                           capabilities)
+            pdt-tick (when pdt (pdt/attach! (:pdt pdt) (:content content) runtime))]
         (.startTicking node (core/duration tick))
         {:identity identity :node node :runtime runtime :spaces spaces
          :authorizer authorizer :blocks blocks :discovery discovery :founding founding
@@ -1000,6 +1029,8 @@
          :capabilities capabilities
          :card-refresher (card-refresher (:facade facade) (core/duration card-refresh))
          :content (:content content) :content-space (:space content)
+         :pdt (:pdt pdt) :pdt-space (:space pdt) :pdt-space-name (:space-name pdt)
+         :pdt-tick pdt-tick :pdt-refs (when pdt (atom {}))
          :config config}))))
 
 ;; ---------------------------------------------------------------- system
@@ -1140,9 +1171,13 @@
   "Closes the system's card refresher, spaces and node. Idempotent enough
   for shutdown hooks."
   [{:keys [^PeerNode node spaces ^Content content ^ReplicatedSpace content-space
-           ^ScheduledExecutorService card-refresher]}]
+           ^ScheduledExecutorService card-refresher pdt pdt-tick ^ReplicatedSpace pdt-space]}]
   (when card-refresher
     (try (.shutdownNow card-refresher) (catch Exception _)))
+  (when pdt
+    (pdt/close! pdt pdt-tick))
+  (when pdt-space
+    (try (.close pdt-space) (catch Exception _)))
   (when content
     (try (.close content) (catch Exception _)))
   (when content-space

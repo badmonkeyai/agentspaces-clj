@@ -28,11 +28,12 @@
             [agentspaces.layer4-options-test]
             [agentspaces.capabilities-test]
             [agentspaces.content-test]
+            [agentspaces.pdt-test]
             [agentspaces.prompts-test]
             [agentspaces.commerce-test]
             [agentspaces.agents-card-test]
             [agentspaces.fleet-parity-test]))
 
 (defn -main [& _]
-  (let [result (t/run-tests (quote agentspaces.space-test) (quote agentspaces.fleet-test) (quote agentspaces.agents-test) (quote agentspaces.layer4-test) (quote agentspaces.layer4-join-test) (quote agentspaces.layer4-returns-test) (quote agentspaces.layer4-verbs-test) (quote agentspaces.layer4-reactions-test) (quote agentspaces.layer4-options-test) (quote agentspaces.capabilities-test) (quote agentspaces.content-test) (quote agentspaces.agents-card-test) (quote agentspaces.fleet-parity-test))]
+  (let [result (t/run-tests (quote agentspaces.space-test) (quote agentspaces.fleet-test) (quote agentspaces.agents-test) (quote agentspaces.layer4-test) (quote agentspaces.layer4-join-test) (quote agentspaces.layer4-returns-test) (quote agentspaces.layer4-verbs-test) (quote agentspaces.layer4-reactions-test) (quote agentspaces.layer4-options-test) (quote agentspaces.capabilities-test) (quote agentspaces.content-test) (quote agentspaces.pdt-test) (quote agentspaces.agents-card-test) (quote agentspaces.fleet-parity-test))]
     (System/exit (if (and (zero? (:fail result)) (zero? (:error result))) 0 1))))

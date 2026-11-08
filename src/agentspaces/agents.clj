@@ -340,6 +340,26 @@
      :peer-signature (.peerSignature c)
      :encryption-public-key (.encryptionPublicKey c)}))
 
+(defn app-card-host
+  "The host group of a published AppCard (SPEC §6.1a.4, v0.1.28, spiral 5):
+  `{:url .. :port .. :host-agent .. :path .. :sign-on (tenant | none)
+  :published-by .. :published-at Instant :status (serving | stopped)}` as the
+  Java record, which refuses a blank url, a port outside 0 to 65535, another
+  sign-on, or another status; `(.withHost card host)` appends it last, and a
+  card without it keeps its bytes."
+  ^ai.badmonkey.agentspaces.api.ad.AppCard$Host
+  [{:keys [url port host-agent path sign-on published-by published-at status]
+    :or {port 0 host-agent "" path "/" sign-on "tenant" published-by "" status "serving"}}]
+  (ai.badmonkey.agentspaces.api.ad.AppCard$Host. url (int port) host-agent path sign-on published-by
+                                                  (or published-at (java.time.Instant/now)) status))
+
+(defn host->map
+  "The host group as a map of its fields, nil for a card without one."
+  [^ai.badmonkey.agentspaces.api.ad.AppCard$Host h]
+  (when h
+    {:url (.url h) :port (.port h) :host-agent (.hostAgent h) :path (.path h) :sign-on (.signOn h)
+     :published-by (.publishedBy h) :published-at (.publishedAt h) :status (.status h)}))
+
 (defn card
   "The bound agent's AgentCard as a map of its public fields: `:agent`,
   `:description`, `:goals`, `:consumes`, `:produces`, `:actions` (each
