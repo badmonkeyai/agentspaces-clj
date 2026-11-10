@@ -5,11 +5,18 @@
   "Persistent data trees over two TCP peers with `:pdt` (PD-C-01): a swap on
   one peer derefs on the other through the Clojure collection interfaces, a
   transient over the Java editor, `add-watch` on the other peer, a 100-key map
-  with equal roots across peers, and the set and vector kinds."
+  with equal roots across peers, the set and vector kinds, and splicing a
+  vector through the RRB path (PDT 2 phase 6, P2-R-05), values too large to
+  ride inline on their head, which cross by the tree fetch (PD-X-01), and a
+  `:text` ref whose texts both peers edit and merge (PDT 2 phase 7, P2-C-04)."
   (:require [clojure.test :refer [deftest is testing]]
             [agentspaces.fleet :as fleet]
             [agentspaces.pdt :as pdt])
-  (:import (java.net ServerSocket)
+  (:import (ai.badmonkey.agentspaces.agent.pdt PRef)
+           (ai.badmonkey.agentspaces.api.space Space Template)
+           (ai.badmonkey.agentspaces.pdt.values PText)
+           (clojure.lang ExceptionInfo)
+           (java.net ServerSocket)
            (java.nio.file Files)))
 
 (defn- free-port []
@@ -183,4 +190,104 @@
           (is (= {:step 3} (peek @log-b)))
           (is (= 2 (count (pop @log-b))))
           (is (= (pdt/root @log-a) (pdt/root @log-b)))))
+      (finally (fleet/stop! b) (fleet/stop! a)))))
+
+(deftest splicing-a-vector-copies-its-path-and-crosses-the-wire
+  ;; PDT 2 phase 6, P2-R-05: subvec, catvec, splice, and insert-at over the RRB path. The vector stays
+  ;; small enough that every version rides inline on its head.
+  (let [port-a (free-port) port-b (free-port)
+        a (fleet/start (config "clj-pdt-splice" port-a nil))
+        b (fleet/start (config "clj-pdt-splice" port-b port-a))]
+    (try
+      (is (await-truthy 10000 #(= 1 (count (.allMembers (.membership (:runtime b)))))))
+      (let [lines-a (pdt/ref a "lines" :vector) lines-b (pdt/ref b "lines" :vector)
+            plain (mapv #(str "line " %) (range 300))]
+        (pdt/swap! lines-a into plain)
+        (is (not (pdt/relaxed? @lines-a)))
+        (testing "an insertion in the middle is relaxed and every element reads"
+          (pdt/swap! lines-a pdt/insert-at 150 :inserted)
+          (is (pdt/relaxed? @lines-a))
+          (is (= (into (conj (subvec plain 0 150) :inserted) (subvec plain 150)) @lines-a))
+          (is (await-truthy 20000 #(= 301 (count @lines-b))))
+          (is (= :inserted (nth @lines-b 150)))
+          (is (= @lines-a @lines-b))
+          (is (= @lines-b (pdt/packed @lines-b)) "= compares elements whatever the shape")
+          (is (not (pdt/relaxed? (pdt/packed @lines-b)))))
+        (testing "subvec, catvec, and splice return PDT vectors"
+          (let [v @lines-a
+                cut (pdt/catvec (pdt/subvec v 0 100) (pdt/subvec v 200))
+                spliced (pdt/splice v 5 2 [:p :q :r])]
+            (is (instance? agentspaces.pdt.PersistentPVector cut))
+            (is (= (into (subvec (vec v) 0 100) (subvec (vec v) 200)) cut))
+            (is (= (into (into (subvec (vec v) 0 5) [:p :q :r]) (subvec (vec v) 7)) spliced))
+            (is (= [:a :b] (pdt/splice [:a :x :b] 1 1 [])) "a plain vector splices as clojure.core would")))
+        (testing "a swap that returns a clojure.core/subvec takes the slice"
+          (pdt/swap! lines-a (fn [v] (into (subvec v 0 10) [:x :y])))
+          (is (= (into (subvec plain 0 10) [:x :y]) @lines-a))
+          (is (await-truthy 20000 #(= 12 (count @lines-b))))
+          (is (= :y (peek @lines-b)))))
+      (finally (fleet/stop! b) (fleet/stop! a)))))
+
+(deftest values-too-large-to-ride-inline-cross-by-the-tree-fetch
+  ;; A value past :inline-delta (32 KiB) travels as a tree the other peer fetches. The fetch goes only to a
+  ;; member whose content-swarm advertisement says trees = 1 (PD-X-01), read from the group's discovery, so
+  ;; the swarm must be built with it; without it every fetch waited out :load-timeout (2026-11-09).
+  (let [port-a (free-port) port-b (free-port)
+        a (fleet/start (config "clj-pdt-large" port-a nil))
+        b (fleet/start (config "clj-pdt-large" port-b port-a))]
+    (try
+      (is (await-truthy 10000 #(= 1 (count (.allMembers (.membership (:runtime b)))))))
+      (testing "a 3,000-element vector, then a relaxed insertion in its middle"
+        (let [lines-a (pdt/ref a "lines" :vector) lines-b (pdt/ref b "lines" :vector)
+              plain (mapv #(str "line " %) (range 3000))]
+          (pdt/swap! lines-a into plain)
+          (is (await-truthy 30000 #(= 3000 (count @lines-b))))
+          (is (= plain @lines-b))
+          (pdt/swap! lines-a pdt/insert-at 1500 :inserted)
+          (is (await-truthy 30000 #(= 3001 (count @lines-b))))
+          (is (= :inserted (nth @lines-b 1500)))
+          (is (= @lines-a @lines-b))))
+      (testing "a 3,000-key map"
+        (let [table-a (pdt/ref a "table" :map) table-b (pdt/ref b "table" :map)
+              entries (into {} (map (fn [i] [(str "key-" i) (str "value " i)])) (range 3000))]
+          (pdt/swap! table-a into entries)
+          (is (await-truthy 30000 #(= 3000 (count @table-b))))
+          (is (= entries (into {} @table-b)))))
+      (finally (fleet/stop! b) (fleet/stop! a)))))
+
+(deftest texts-on-a-text-ref-merge-the-edits-of-both-peers
+  ;; PDT 2 phase 7, P2-C-04 (P2-T-02, P2-T-03): a :text ref is a map whose values are texts. Each peer
+  ;; edits them under its own replica with pdt/insert and pdt/delete, and two edits that meet merge by
+  ;; the union of their characters, whichever order the heads arrive in.
+  (let [port-a (free-port) port-b (free-port)
+        a (fleet/start (config "clj-pdt-text" port-a nil))
+        b (fleet/start (config "clj-pdt-text" port-b port-a))]
+    (try
+      (is (await-truthy 10000 #(= 1 (count (.allMembers (.membership (:runtime b)))))))
+      (let [notes-a (pdt/ref a "notes" :text) notes-b (pdt/ref b "notes" :text)
+            text-of (fn [r] (some-> (:doc @r) str))]
+        (testing "each peer writes under the replica of its agent"
+          (is (= (PText/replicaOf (.agent ^ai.badmonkey.agentspaces.identity.PeerIdentity (:identity a) "clj"))
+                 (.replica ^PText (pdt/text a))))
+          (is (not= (.replica ^PText (pdt/text a)) (.replica ^PText (pdt/text b))))
+          (is (= "#pdt/text \"hi\"" (pr-str (pdt/text a "hi")))))
+        (testing "a text written on one peer reads on the other"
+          (pdt/swap! notes-a assoc :doc (pdt/text a "ac"))
+          (is (= "ac" (text-of notes-a)))
+          (is (await-truthy 20000 #(= "ac" (text-of notes-b))))
+          (is (= #{2} (set (map #(.v ^PRef %) (.readAll ^Space (:pdt-space b) (Template/of PRef) 64))))
+              "a value that holds a text writes version 2 heads (rule 3 of 6.10.3)"))
+        (testing "each peer edits the text the other wrote"
+          (pdt/swap! notes-b update :doc pdt/insert 1 "b")
+          (is (await-truthy 20000 #(= "abc" (text-of notes-a))))
+          (pdt/swap! notes-a update :doc pdt/delete 0 1)
+          (is (await-truthy 20000 #(= "bc" (text-of notes-b)))))
+        (testing "edits made at once on both peers meet in their union"
+          (let [on-a (future (pdt/swap! notes-a update :doc pdt/insert 0 "X"))]
+            (pdt/swap! notes-b update :doc pdt/insert 2 "Y")
+            @on-a)
+          (is (await-truthy 20000 #(and (= "XbcY" (text-of notes-a)) (= "XbcY" (text-of notes-b))))
+              (str (text-of notes-a) " and " (text-of notes-b))))
+        (testing "a :text ref holds texts only"
+          (is (thrown? ExceptionInfo (pdt/swap! notes-a assoc :plain "not a text")))))
       (finally (fleet/stop! b) (fleet/stop! a)))))

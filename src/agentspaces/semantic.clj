@@ -28,6 +28,16 @@
       (throw (ex-info "no semantic discovery: start the peer with {:capabilities {:semantic true}}"
                       {:capabilities (keys (:capabilities system))}))))
 
+(defn- app-description
+  "An AppCard's inline text (SPEC §6.1a.2, v0.1.32; AppCard origin and
+  formats, 2026-11-09): kind and shape, owner, url, then the origin's system
+  and ref and every format, which a stub keeps."
+  [^AppCard app]
+  (let [origin (.origin app)]
+    (clojure.string/join " " (cond-> [(str (.kind app) "/" (.shape app)) (.owner app) (.url app)]
+                               origin (conj (.system origin) (.ref origin))
+                               (.formats app) (into (.formats app))))))
+
 (defn- match->map [^SemanticDiscovery$Match m]
   (let [ad (.advertisement m)]
     (cond-> {:score (.score m) :advertisement ad}
@@ -36,7 +46,7 @@
       (instance? AssetCard ad) (assoc :kind :asset :name (.asset ^AssetCard ad)
                                       :description (.description ^AssetCard ad))
       (instance? AppCard ad) (assoc :kind :app :name (.name ^AppCard ad)
-                                    :description (str (.kind ^AppCard ad) "/" (.shape ^AppCard ad) " " (.owner ^AppCard ad) " " (.url ^AppCard ad)))
+                                    :description (app-description ad))
       (instance? ModelCard ad) (assoc :kind :model :name (.name ^ModelCard ad)
                                       :description (str (clojure.string/join " " (.tasks ^ModelCard ad)) " on " (.engine ^ModelCard ad))))))
 

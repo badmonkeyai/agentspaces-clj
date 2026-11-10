@@ -3,6 +3,34 @@
 What changed in the bindings, newest first. The Java core's history is in
 the root `CHANGELOG.md` of the AgentSpaces workspace.
 
+## Unreleased: 0.6.0
+
+The bindings move to version 0.6.0 with the AgentSpaces core and build on
+its 0.6.0 Java libraries.
+
+PDT 2 phase 7 (srad/agentspaces-pdt2.md, P2-C-04) adds texts and content
+stores to `agentspaces.pdt`. Eighty-four tests, three of them new.
+
+- **Texts.** `(pdt/ref system "notes" :text)` is a map whose values are
+  texts that merge (`PText`). `pdt/text` makes one under this peer's
+  replica, and `pdt/insert` and `pdt/delete` edit it. Two peers' edits of
+  one text meet in the union of their characters. The heads are version 2.
+- **Pins and challenges.** `pdt/store-pin!` asks the group's content
+  stores to hold a root and writes a pin this peer signs.
+  `pdt/store-status` lists the stores' receipts for a root, and
+  `pdt/challenge!` returns a future of a possession challenge's outcome.
+  `fleet/start` now gives the facade the peer's identity and the group's
+  discovery, which pins need, and takes `:pdt {:challenge-deadline "2s"}`.
+- **A store peer.** `:store {:name :capacity :accept-requesters ..}` makes
+  the peer a content store, as `agentspaces.store.*` does in Spring
+  (`agentspaces.store/policy` lists the keys). The peer's content swarm then
+  advertises feature level 2. A `:store` without `:pdt` or `:capacity`
+  refuses to start and names the key. `deps.edn` gains `agentspaces-store`,
+  and `fleet/start` loads `agentspaces.store` only for a `:store`, so a
+  classpath the Clojure CLI cached before this release still loads.
+- **DataScript.** `datascript-conn` stays in `agentspaces-datascript`, as
+  decision 1 of the design places it, so these bindings pin no DataScript.
+
 ## 0.5.0 (2026-11-02, in preparation; not yet on Clojars)
 
 Parity with the Spring starter at AgentSpaces 0.5.0, from the review

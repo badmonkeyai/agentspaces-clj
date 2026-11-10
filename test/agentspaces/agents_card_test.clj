@@ -49,7 +49,7 @@
 
 (defagent Desk
   {:description "Answers the chat"
-   :ui [{:catalog "bma-widgets" :component "ChatInput" :id "ask" :role "control" :controls ["file"] :reads true :writes true}]}
+   :ui [{:catalog "example-widgets" :component "MessageInput" :id "ask" :role "control" :controls ["file"] :reads true :writes true}]}
   (take file [^Fixtures$TaskEntry t] {:space "work" :poll-timeout "200ms"}
     ^Fixtures$FindingEntry
     (Fixtures$FindingEntry. (:topic t) "filed")))
@@ -63,9 +63,9 @@
             plain (agents/card (agents/bind! a (->Clerk)))]
         (is (= "a2ui" (:protocol ui)))
         (is (= "v0.9.1" (:version ui)))
-        (is (= [{:id "ask" :catalog-id "bma-widgets" :component "ChatInput" :entry "" :controls ["file"] :role "control"}]
+        (is (= [{:id "ask" :catalog-id "example-widgets" :component "MessageInput" :entry "" :controls ["file"] :role "control"}]
                (:components ui)))
-        (is (= ["bma-widgets"] (:catalog-ids ui)))
+        (is (= ["example-widgets"] (:catalog-ids ui)))
         (is (nil? (:ui plain)) "an agent without :ui carries no declaration"))
       (finally (fleet/stop! a)))))
 

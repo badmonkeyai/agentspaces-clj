@@ -10,38 +10,40 @@
 {:paths ["src"]
 
  :deps {org.clojure/clojure {:mvn/version "1.11.1"}
-        ai.badmonkey.agentspaces/agentspaces-common {:mvn/version "0.5.0"}
-        ai.badmonkey.agentspaces/agentspaces-api {:mvn/version "0.5.0"}
-        ai.badmonkey.agentspaces/agentspaces-identity {:mvn/version "0.5.0"}
-        ai.badmonkey.agentspaces/agentspaces-space {:mvn/version "0.5.0"}
-        ai.badmonkey.agentspaces/agentspaces-peering {:mvn/version "0.5.0"}
+        ai.badmonkey.agentspaces/agentspaces-common {:mvn/version "0.6.0"}
+        ai.badmonkey.agentspaces/agentspaces-api {:mvn/version "0.6.0"}
+        ai.badmonkey.agentspaces/agentspaces-identity {:mvn/version "0.6.0"}
+        ai.badmonkey.agentspaces/agentspaces-space {:mvn/version "0.6.0"}
+        ai.badmonkey.agentspaces/agentspaces-peering {:mvn/version "0.6.0"}
         ;; DiscoveryService, for `:group {:advertise true}` (space advertisements).
-        ai.badmonkey.agentspaces/agentspaces-discovery {:mvn/version "0.5.0"}
+        ai.badmonkey.agentspaces/agentspaces-discovery {:mvn/version "0.6.0"}
         ;; GroupKeyDistributor and CapabilityRuntime, for :content-key-rotation (v0.1.13).
-        ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.5.0"}
+        ai.badmonkey.agentspaces/agentspaces-capabilities {:mvn/version "0.6.0"}
         ;; AgentBinder, the AgentSpaces facade, the typed clients, and remote actions:
         ;; the programming model behind agentspaces.agents (L3L4-COVERAGE.md §6.2).
-        ai.badmonkey.agentspaces/agentspaces-agent {:mvn/version "0.5.0"}
+        ai.badmonkey.agentspaces/agentspaces-agent {:mvn/version "0.6.0"}
         ;; The content swarm (srad/large-networks-bulk-data.md): `:content` in fleet/start and agentspaces.content.
-        ai.badmonkey.agentspaces/agentspaces-content {:mvn/version "0.5.0"}
+        ai.badmonkey.agentspaces/agentspaces-content {:mvn/version "0.6.0"}
         ;; Persistent data trees (srad/agentspaces-pdt.md, PD-C-01): `:pdt` in fleet/start and agentspaces.pdt.
-        ai.badmonkey.agentspaces/agentspaces-pdt {:mvn/version "0.5.0"}}
+        ai.badmonkey.agentspaces/agentspaces-pdt {:mvn/version "0.6.0"}
+        ;; StoreChooser, whose Need appears in Pdt.storeFor, so the Pdt calls of agentspaces.pdt compile
+        ;; (PDT 2 follow-ups, 2026-11-09, F4). Named here so a classpath cached before agentspaces-pdt
+        ;; gained the dependency is computed again.
+        ai.badmonkey.agentspaces/agentspaces-planner {:mvn/version "0.6.0"}
+        ;; ContentStore and StorePolicy: `:store` in fleet/start makes this peer a content store
+        ;; (PDT 2 phase 7, P2-C-04; srad/agentspaces-pdt2.md §3.2), as agentspaces.store.* does in Spring.
+        ai.badmonkey.agentspaces/agentspaces-store {:mvn/version "0.6.0"}}
 
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {ai.badmonkey.agentspaces/agentspaces-test-support
-                      {:mvn/version "0.5.0"}}
+                      {:mvn/version "0.6.0"}}
          :main-opts ["-e" "(require 'agentspaces.run-tests) (agentspaces.run-tests/-main)"]}
 
   ;; A worker on example 02's research fleet (run-polyglot-test.sh at the workspace root):
   ;; clojure -M:research-worker examples/research_worker.clj PORT SEED
   :research-worker {:extra-paths ["examples"]
-                    :extra-deps {ai.badmonkey.agentspaces/example-02-research-fleet {:mvn/version "0.5.0"}}}
-
-  ;; A worker that declares its data use to the platform console (enterprise-platform CrossLanguageConsoleTest):
-  ;; clojure -M:datause-worker examples/datause_worker.clj PORT SEED FOUNDING [MAX-SECONDS]
-  :datause-worker {:extra-paths ["examples"]
-                   :extra-deps {ai.badmonkey.platform/bma-console-common {:mvn/version "0.1.0"}}}
+                    :extra-deps {ai.badmonkey.agentspaces/example-02-research-fleet {:mvn/version "0.6.0"}}}
 
   ;; The release build: clojure -T:build jar | install. See build.clj.
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.14"}}

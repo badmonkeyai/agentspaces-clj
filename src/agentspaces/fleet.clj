@@ -58,12 +58,12 @@
            (ai.badmonkey.agentspaces.common.codec CborCodec)
            (ai.badmonkey.agentspaces.common.crypto GroupKey)
            (ai.badmonkey.agentspaces.common.id AgentId GroupId PeerId)
-           (ai.badmonkey.agentspaces.discovery DiscoveryService)
+           (ai.badmonkey.agentspaces.discovery AdCache DiscoveryService)
            (ai.badmonkey.agentspaces.identity AgentKeystore ChannelTrust FileKeystore
                                               PeerIdentity ServingCredential)
            (ai.badmonkey.agentspaces.peering.blocks BlockExchange)
            (ai.badmonkey.agentspaces.peering.bootstrap BootstrapChain MulticastLocator SeedsLocator)
-           (ai.badmonkey.agentspaces.content CompositeStore Content Content$Builder ContentPolicy ContentPolicy$SeedMode
+           (ai.badmonkey.agentspaces.content CompositeStore Content Content$Builder ContentSpillStore ContentPolicy ContentPolicy$SeedMode
                                              FilePieceStore InPlaceStore MemoryPieceStore PieceStore SpacePayloads)
            (ai.badmonkey.agentspaces.content.tree TreeStore)
            (ai.badmonkey.agentspaces.peering.membership GroupMembership$Config
@@ -282,7 +282,7 @@
 ;; ------------------------------------------------------------------ node
 
 (defn- build-node
-  ^PeerNode [{:keys [roles require-attestation multicast revocation-validator security peer-ad-interval lazy-push]}
+  ^PeerNode [{:keys [roles require-attestation multicast revocation-validator security peer-ad-interval lazy-push appcard-level]}
              {:keys [channel-auth]} ^PeerIdentity identity]
   (let [^PeerNode$Builder builder
         (-> (PeerNode/builder identity)
@@ -296,6 +296,8 @@
       (.peerAdInterval builder (core/duration peer-ad-interval)))
     (when (some? lazy-push)
       (.lazyPush builder (boolean lazy-push)))
+    (when appcard-level
+      (.appCardLevel builder (int appcard-level)))
     (when multicast
       (let [{:keys [group interval] :or {group "239.255.42.99:7787" interval "5s"}}
             (if (map? multicast) multicast {})]
@@ -685,11 +687,45 @@
                       (.holdingLease (core/lease holding-lease)))]
       (when-let [ring (:key-ring context)] (.keyRing ^Content$Builder builder ring))
       (when authorizer (.authorizer ^Content$Builder builder authorizer))
+      ;; The members' content-swarm advertisements, read local-first from the group's discovery: whether a
+      ;; member speaks the tree exchange (PD-X-01), its PDT level (P2-F-05), and whether the group seals
+      ;; (PD-P-03). Without them the swarm sends no tree request, so a PDT value too large to ride inline
+      ;; on its head never arrived (2026-11-09).
+      (when-let [^DiscoveryService discovery (:discovery context)]
+        (.discovery ^Content$Builder builder discovery))
+      ;; `:store`: a content store's swarm advertises pdt = "2" (P2-S-01, P2-F-05)
+      (when (:store config) (.pdtLevel ^Content$Builder builder (int Content/PDT_LEVEL)))
       ;; `:pdt`: the persistent data trees' node store serves and fetches trees (PD-X-03, PD-C-01).
       (when-let [tree-store (:tree-store context)] (.treeStore ^Content$Builder builder ^TreeStore tree-store))
       (let [content (.build ^Content$Builder builder)]
+        ;; SPEC §6.1a.5 (v0.1.32): the swarm takes the parts documents of this group's large cards
+        (when-let [^DiscoveryService discovery (:discovery context)]
+          (.spillStore discovery (ContentSpillStore. content)))
         {:content content :space content-space :bulk (SpacePayloads. content)
          :escalate-above (->bytes-size escalate-above)}))))
+
+(defn- build-discovery
+  "The group's discovery (SPEC §6.3 and §6.1a.5, v0.1.32; AppCard origin and
+  formats, 2026-11-09): the cache's entry bound and byte budget from
+  `:ad-cache-max-entries` and `:ad-cache-max-bytes`, each the role's default
+  when unset (times four for a rendezvous), and the spill fetch bound from
+  `:spill-max-fetch-bytes`."
+  ^DiscoveryService [config ^GroupRuntime runtime ^CborCodec codec ^PeerIdentity identity]
+  (let [roles (->roles (:roles config))
+        {:keys [ad-cache-max-entries ad-cache-max-bytes spill-max-fetch-bytes]} config
+        clock (InstantSource/system)
+        cache (AdCache. codec clock
+                        (int (or ad-cache-max-entries (DiscoveryService/cacheBoundFor roles)))
+                        (long (or ad-cache-max-bytes (DiscoveryService/cacheBytesFor roles))))]
+    (cond-> (DiscoveryService. runtime cache codec (.peerId identity))
+      spill-max-fetch-bytes (.maxSpillFetchBytes (long spill-max-fetch-bytes)))))
+
+(defn- store-fn
+  "A function of `agentspaces.store`, loaded only for a `:store` block (PDT 2
+  phase 7, P2-C-04), so a classpath the Clojure CLI cached before
+  agentspaces-clj named agentspaces-store still loads this namespace."
+  [sym]
+  (requiring-resolve (symbol "agentspaces.store" (name sym))))
 
 (defn- build-pdt
   "The `:pdt` block (srad/agentspaces-pdt.md §7.2, PD-C-01): the ref space and
@@ -700,7 +736,7 @@
   (when-let [pdt-config (let [c (:pdt config)] (cond (map? c) c (true? c) {} :else nil))]
     (let [space-name (or (:space pdt-config) "pdt")
           ref-space (build-space context {:name space-name :settle "150ms"})]
-      {:pdt (pdt/build pdt-config ref-space (get-in config [:group :name]))
+      {:pdt (pdt/build pdt-config ref-space (get-in config [:group :name]) (:identity context) (:discovery context))
        :space ref-space
        :space-name space-name})))
 
@@ -862,6 +898,11 @@
                    when absent) with their ref space; agentspaces.pdt/ref,
                    swap!, and the Clojure collections over PMap, PSet, and
                    PVector (srad/agentspaces-pdt.md appendix C, PD-C-01)
+    :store         {:name \"site-a\" :capacity \"2TiB\" :accept-requesters :grant ..}:
+                   this peer is a content store that takes pins, holds roots,
+                   and answers challenges (agentspaces.store.*; PDT 2 phase 7,
+                   P2-C-04); needs :pdt, and its swarm advertises feature
+                   level 2. agentspaces.store/policy lists the keys
 
     :identity      a PeerIdentity to reuse
     :keystore      a directory path for a persistent identity (keystore)
@@ -872,6 +913,13 @@
                    self-pruning tree toward members that understand it (default true)
     :peer-ad-interval  how often the self-advertisement is re-flooded, default
                    \"30s\"; newcomers get it directly in between (peer-ad-interval-millis)
+    :appcard-level the AppCard level advertised as wire.appcard, 2 by default; 1
+                   advertises no hint, so a test builds a mixed fleet (SPEC §6.1a.2)
+    :ad-cache-max-entries, :ad-cache-max-bytes  the advertisement cache's two
+                   bounds, by default 8192 and 33554432 (times four on a
+                   rendezvous) (discovery.cache.max-entries, .max-bytes)
+    :spill-max-fetch-bytes  the largest parts document resolve-card fetches,
+                   default 16777216 (discovery.spill.max-fetch-bytes)
     :security      {:profile :dev-local|:mtls|:mtls-oidc|:zero-trust
                     :grants {:raft-voter [peer ..] :raft-client [..]
                              :directive-issuer [..]
@@ -963,7 +1011,10 @@
   follows the effective transport) or an explicit \"tls://\" / \"tcp://\"."
   [{:keys [bind tick tls group multicast card-refresh] :or {tick "250ms" card-refresh "5m"} :as config}]
   (validate-group group multicast)
+  (when (and (:store config) (not (:pdt config)))
+    (throw (ex-info "a :store needs :pdt, the persistent data trees it holds roots of" {:keys (keys config)})))
   (let [config (if (and (:pdt config) (not (:content config))) (assoc config :content true) config)
+        store-policy (when-let [store (:store config)] ((store-fn 'policy) store))
         identity (->identity config)
         {:keys [transport channel-auth profile] :as posture} (posture config)
         node (build-node config posture identity)
@@ -985,9 +1036,7 @@
           discovery (when (or (:advertise group) (:content-key group)
                               (:content-key-rotation group) (:capabilities config)
                               (:agents config) (:content config))
-                      (DiscoveryService/create runtime codec (.peerId identity)
-                                               (InstantSource/system)
-                                               (->roles (:roles config))))
+                      (build-discovery config runtime codec identity))
           agents (agent-identities config identity)
           ring (content-key-ring config group runtime codec)
           key-wrap (start-key-wrap config group runtime identity ring authorizer discovery codec)
@@ -1019,7 +1068,11 @@
                            (do (.provide ^AgentSpaces$GroupContext (:group facade) ^Content (:content content))
                                (assoc capabilities :content (:content content)))
                            capabilities)
-            pdt-tick (when pdt (pdt/attach! (:pdt pdt) (:content content) runtime))]
+            pdt-tick (when pdt (pdt/attach! (:pdt pdt) (:content content) runtime))
+            store (when store-policy
+                    ((store-fn 'start!) {:policy store-policy :name (get-in config [:store :name]) :pdt (:pdt pdt)
+                                         :discovery discovery :identity identity :authorizer authorizer
+                                         :runtime runtime}))]
         (.startTicking node (core/duration tick))
         {:identity identity :node node :runtime runtime :spaces spaces
          :authorizer authorizer :blocks blocks :discovery discovery :founding founding
@@ -1031,6 +1084,7 @@
          :content (:content content) :content-space (:space content)
          :pdt (:pdt pdt) :pdt-space (:space pdt) :pdt-space-name (:space-name pdt)
          :pdt-tick pdt-tick :pdt-refs (when pdt (atom {}))
+         :store (:store store) :store-tick (:tick store) :agent-name agent-name
          :config config}))))
 
 ;; ---------------------------------------------------------------- system
@@ -1171,9 +1225,11 @@
   "Closes the system's card refresher, spaces and node. Idempotent enough
   for shutdown hooks."
   [{:keys [^PeerNode node spaces ^Content content ^ReplicatedSpace content-space
-           ^ScheduledExecutorService card-refresher pdt pdt-tick ^ReplicatedSpace pdt-space]}]
+           ^ScheduledExecutorService card-refresher pdt pdt-tick ^ReplicatedSpace pdt-space store store-tick]}]
   (when card-refresher
     (try (.shutdownNow card-refresher) (catch Exception _)))
+  (when store
+    ((store-fn 'close!) {:store store :tick store-tick}))
   (when pdt
     (pdt/close! pdt pdt-tick))
   (when pdt-space

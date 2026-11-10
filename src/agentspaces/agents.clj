@@ -341,17 +341,47 @@
      :encryption-public-key (.encryptionPublicKey c)}))
 
 (defn app-card-host
-  "The host group of a published AppCard (SPEC §6.1a.4, v0.1.28, spiral 5):
-  `{:url .. :port .. :host-agent .. :path .. :sign-on (tenant | none)
+  "The host group of a published AppCard (SPEC §6.1a.4, v0.1.28, ISSUE-AppHost;
+  v0.1.32 sign-on values, AppCard origin and formats, 2026-11-09):
+  `{:url .. :port .. :host-agent .. :path .. :sign-on (idp | none)
   :published-by .. :published-at Instant :status (serving | stopped)}` as the
   Java record, which refuses a blank url, a port outside 0 to 65535, another
-  sign-on, or another status; `(.withHost card host)` appends it last, and a
-  card without it keeps its bytes."
+  sign-on (tenant among them), or another status; `:sign-on` is idp, the
+  identity provider of whoever runs the host, by default. `(.withHost card
+  host)` appends it, and a card without it keeps its bytes."
   ^ai.badmonkey.agentspaces.api.ad.AppCard$Host
   [{:keys [url port host-agent path sign-on published-by published-at status]
-    :or {port 0 host-agent "" path "/" sign-on "tenant" published-by "" status "serving"}}]
+    :or {port 0 host-agent "" path "/" sign-on "idp" published-by "" status "serving"}}]
   (ai.badmonkey.agentspaces.api.ad.AppCard$Host. url (int port) host-agent path sign-on published-by
                                                   (or published-at (java.time.Instant/now)) status))
+
+(defn app-card-origin
+  "The origin group of an AppCard (SPEC §6.1a.2, v0.1.32; AppCard origin and
+  formats, 2026-11-09): `{:system .. :ref .. :version .. :attrs {..}}` as the
+  Java record through `AppCard.Origin/of`, so a nil version is \"\" and an
+  empty attrs map is absent. The record refuses a system outside its grammar,
+  a ref or version past its bound, and an attrs key that is not
+  `<system>.<name>`; `(.withOrigin card origin)` appends it after the host."
+  ^ai.badmonkey.agentspaces.api.ad.AppCard$Origin
+  [{:keys [system ref version attrs]}]
+  (ai.badmonkey.agentspaces.api.ad.AppCard$Origin/of system ref version attrs))
+
+(defn resolve-card
+  "The full card of a stub (SPEC §6.1a.5, v0.1.32): a card without a spill
+  reference as it is, and otherwise the stub with its parts document, fetched
+  from the content swarm and checked, in place. Throws when the document is
+  over the fetch bound, fails a check, no content swarm serves the group, or
+  the fetch outlasts `timeout` (default \"30s\"); the cached stub stays either
+  way."
+  ([system card] (resolve-card system card "30s"))
+  ([system card timeout]
+   (let [^ai.badmonkey.agentspaces.discovery.DiscoveryService discovery
+         (or (:discovery system) (throw (ex-info "no discovery: start the peer with :agents, :content, or a capability" {})))]
+     (try
+       (.get (.resolve discovery card) (.toMillis ^java.time.Duration (core/duration timeout))
+             java.util.concurrent.TimeUnit/MILLISECONDS)
+       (catch java.util.concurrent.ExecutionException e
+         (throw (or (.getCause e) e)))))))
 
 (defn host->map
   "The host group as a map of its fields, nil for a card without one."

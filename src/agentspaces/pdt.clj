@@ -47,24 +47,58 @@
   back as Clojure values (maps, vectors, strings, numbers, byte arrays), so
   `get-in`, `assoc-in`, and `update` work on them; keys of nested maps are
   written as strings by CBOR, nested sets come back as vectors, and ratios as
-  doubles. A map value or set element cannot be nil."
-  (:refer-clojure :exclude [ref swap!])
+  doubles. A map value or set element cannot be nil.
+
+  Splicing (PDT 2 phase 6, P2-R-05). `subvec`, `catvec`, `splice`, and
+  `insert-at` run on a PDT vector in O(log n) node copies through the Java RRB
+  operations and return a PDT vector that shares every node off the edited
+  path; on any other vector they do what `clojure.core` does. A swap function
+  may also return a `clojure.core/subvec` of the current vector, so
+  `(into (subvec v 0 i) xs)` costs O(log n) per element of `xs`: the swap takes
+  the slice of the edited vector instead of copying it. A spliced vector may be
+  relaxed (an `rr` root, read by version 2 readers only); `packed` gives the
+  dense vector of the same elements, and `=` compares elements whatever the
+  shape.
+
+  Texts (PDT 2 phase 7, P2-C-04). A `:text` ref is a map whose values are
+  texts that merge (`PText`, srad/agentspaces-pdt2.md §3.9). `text` makes
+  one under this peer's replica, `insert` and `delete` edit it, and `str`
+  reads it; two peers' edits of one text meet in the union of their
+  characters, with no conflict. Its heads are version 2, so readers at
+  feature level 1 skip the ref.
+
+      (def notes (pdt/ref system \"notes\" :text))
+      (pdt/swap! notes assoc :doc (pdt/text system \"hello\"))
+      (pdt/swap! notes update :doc pdt/insert 5 \" world\")
+
+  Content stores (PDT 2 phase 7, P2-C-04). `store-pin!` asks the group's
+  content stores to hold a root, `store-status` shows the copies they hold,
+  and `challenge!` makes a store prove it holds a root. A `fleet/start`
+  system with `:store` is a content store itself (`agentspaces.store`)."
+  (:refer-clojure :exclude [ref swap! subvec])
   (:require [agentspaces.core :as core]
             [clojure.java.io :as io])
-  (:import (ai.badmonkey.agentspaces.api.space Space Subscription)
-           (ai.badmonkey.agentspaces.content Content)
+  (:import (ai.badmonkey.agentspaces.agent.content StorePin StoreReceipt)
+           (ai.badmonkey.agentspaces.api.ad AssetCard)
+           (ai.badmonkey.agentspaces.api.space Space Subscription)
+           (ai.badmonkey.agentspaces.content Content Content$ChallengeResult)
+           (ai.badmonkey.agentspaces.discovery DiscoveryService)
+           (ai.badmonkey.agentspaces.identity PeerIdentity)
            (ai.badmonkey.agentspaces.peering.blocks BlockStore MemoryBlockStore)
            (ai.badmonkey.agentspaces.peering.node GroupRuntime)
+           (ai.badmonkey.agentspaces.planner StoreChooser$Need)
            (ai.badmonkey.agentspaces.pdt NodeStore Pdt Pdt$Builder Pdt$Stats)
            (ai.badmonkey.agentspaces.pdt.blob FileEntry PBlob TreePublisher TreePublisher$Published)
            (ai.badmonkey.agentspaces.pdt.refs Heads Heads$Head PConflict Ref)
            (ai.badmonkey.agentspaces.pdt.store PackNodeStore)
-           (ai.badmonkey.agentspaces.pdt.values Codec Editor PMap PSet PVector SetEditor VectorEditor)
-           (clojure.lang MapEntry)
+           (ai.badmonkey.agentspaces.pdt.stores Stores Stores$Pinning)
+           (ai.badmonkey.agentspaces.pdt.values Codec Editor PMap PSet PText PVector SetEditor VectorEditor)
+           (clojure.lang APersistentVector$SubVector MapEntry)
            (java.nio.file Path)
            (java.time InstantSource)
            (java.util Collections Iterator Map$Entry Optional)
-           (java.util.function Consumer UnaryOperator)))
+           (java.util.concurrent CompletableFuture)
+           (java.util.function Consumer Function UnaryOperator)))
 
 (set! *warn-on-reflection* true)
 
@@ -137,6 +171,18 @@
 (def ^:private tree-conv
   {:k-in str :k-out identity :v-in ->file-entry :v-out file-entry->map
    :keys (Codec/of String) :values (FileEntry/codec)})
+
+(defn- ->text [v]
+  (if (instance? PText v)
+    v
+    (throw (ex-info "a :text ref holds texts: make one with (pdt/text system s)" {:value (type v)}))))
+
+(defn- text-conv
+  "The conversion of a `:text` ref (PDT 2 phase 7, P2-C-04): keys as in a map
+  ref, values texts read and written by `PText.codec` under this peer's
+  replica, so the heads are version 2 and two texts merge by their union."
+  [replica]
+  {:k-in ->java :k-out ->clj :v-in ->text :v-out identity :keys object-codec :values (PText/codec replica)})
 
 (declare ->PersistentPMap ->TransientPMap ->PersistentPSet ->TransientPSet ->PersistentPVector ->TransientPVector)
 
@@ -317,7 +363,7 @@
   (empty [_] (PersistentPVector. (PVector/empty (.store pv) (.loader pv) ^Codec (:values conv)) conv _meta))
   (equiv [this o]
     (cond
-      (instance? PersistentPVector o) (= (.root pv) (.root ^PVector (.-pv ^PersistentPVector o)))
+      (instance? PersistentPVector o) (.equals pv (.-pv ^PersistentPVector o))
       (sequential? o) (and (= (count this) (count o)) (every? true? (map = (seq this) (seq o))))
       :else false))
   (peek [_] (let [^Optional o (.peek pv)] (when (.isPresent o) ((:v-out conv) (.get o)))))
@@ -367,6 +413,93 @@
   (valAt [this k] (.valAt this k nil))
   (valAt [this k nf] (if (index-of? (.count editor) k) (.nth this (int k)) nf)))
 
+;; ------------------------------------------------------------------ splicing (PDT 2 phase 6, P2-R-05)
+
+(defn- pdt-vector? [v] (instance? PersistentPVector v))
+
+(defn- with-pv [^PersistentPVector w ^PVector pv]
+  (PersistentPVector. pv (.-conv w) (meta w)))
+
+(defn subvec
+  "The elements `[start, end)` of a vector: on a PDT vector an O(log n) slice
+  that shares every node off its two cut paths (P2-R-05), on any other vector
+  `clojure.core/subvec`."
+  ([v start] (subvec v start (count v)))
+  ([v start end]
+   (if (pdt-vector? v)
+     (with-pv v (.slice ^PVector (.-pv ^PersistentPVector v) (long start) (long end)))
+     (clojure.core/subvec v start end))))
+
+(defn catvec
+  "Vectors joined in order: two PDT vectors in O(log n) node copies
+  (P2-R-05), anything else by `into`."
+  ([] [])
+  ([a] a)
+  ([a b]
+   (if (and (pdt-vector? a) (pdt-vector? b))
+     (with-pv a (.concat ^PVector (.-pv ^PersistentPVector a) (.-pv ^PersistentPVector b)))
+     (into a b)))
+  ([a b & more] (reduce catvec (catvec a b) more)))
+
+(defn splice
+  "The vector with `n` elements from `index` replaced by the elements of
+  `coll`: on a PDT vector in O(log n) node copies plus `coll` (P2-R-05)."
+  [v index n coll]
+  (if (pdt-vector? v)
+    (let [^PersistentPVector w v
+          in (:v-in (.-conv w))
+          items (java.util.ArrayList. ^java.util.Collection (mapv #(in (required % "vector element")) coll))]
+      (with-pv w (.splice ^PVector (.-pv w) (long index) (long n) items)))
+    (-> (clojure.core/subvec v 0 index) (into coll) (into (clojure.core/subvec v (+ index n))))))
+
+(defn insert-at
+  "The vector with `x` inserted before `index`, at most its count (P2-R-05)."
+  [v index x]
+  (splice v index 0 [x]))
+
+(defn packed
+  "The dense form of a PDT vector (P2-R-03): the `vr` vector of the same
+  elements, whose root those elements have whatever edits made them, and
+  which every reader reads. A dense vector is its own packed form."
+  [v]
+  (with-pv v (.packed ^PVector (.-pv ^PersistentPVector v))))
+
+(defn relaxed?
+  "Whether a PDT vector's tree holds relaxed nodes, so its head is version 2 (P2-R-01)."
+  [v]
+  (.relaxed ^PVector (.-pv ^PersistentPVector v)))
+
+;; ------------------------------------------------------------------ texts (PDT 2 phase 7, P2-C-04)
+
+(defn- replica
+  "This peer's replica of texts (P2-T-02): `PText.replicaOf` its agent's id,
+  so each peer's edits carry ids no other peer uses."
+  ^String [system]
+  (PText/replicaOf (.agent ^PeerIdentity (:identity system)
+                           ^String (or (:agent-name system)
+                                       (throw (ex-info "texts need a fleet/start system" {:keys (keys system)}))))))
+
+(defn text
+  "A new text under this peer's replica (P2-T-02), empty or holding `s`: the
+  value a `:text` ref holds. Make a text once and edit it with `insert` and
+  `delete`: two peers' edits of one text merge by the union of their
+  characters, while a new text put under a key replaces the one there."
+  (^PText [system] (PText/empty (replica system)))
+  (^PText [system s] (.insert (PText/empty (replica system)) 0 (str s))))
+
+(defn insert
+  "The text with `s` inserted before position `pos`, counted in code points (P2-T-02)."
+  ^PText [^PText t pos s]
+  (.insert t (long pos) (str s)))
+
+(defn delete
+  "The text without the `n` code points from position `pos` (P2-T-02)."
+  ^PText [^PText t pos n]
+  (.delete t (long pos) (long n)))
+
+(defmethod print-method PText [^PText t ^java.io.Writer w]
+  (.write w "#pdt/text ") (print-method (str t) w))
+
 (defmethod print-method PersistentPMap [^PersistentPMap m ^java.io.Writer w]
   (.write w "#pdt/map ") (print-method (into {} (seq m)) w))
 
@@ -403,7 +536,7 @@
   it is a plain Clojure collection or was built over another store."
   [kind result wrapped-current current]
   (case kind
-    (:map :tree)
+    (:map :tree :text)
     (cond
       (and (instance? PersistentPMap result) (same-store? (.-pm ^PersistentPMap result) current)) (.-pm ^PersistentPMap result)
       (map? result) (.-pm ^PersistentPMap (into (empty wrapped-current) result))
@@ -416,6 +549,12 @@
     :vector
     (cond
       (and (instance? PersistentPVector result) (same-store? (.-pv ^PersistentPVector result) current)) (.-pv ^PersistentPVector result)
+      ;; PDT 2 phase 6 (P2-R-05): a clojure.core/subvec of a PDT vector is a slice of it, O(log n)
+      (and (instance? APersistentVector$SubVector result)
+           (instance? PersistentPVector (.-v ^APersistentVector$SubVector result))
+           (same-store? (.-pv ^PersistentPVector (.-v ^APersistentVector$SubVector result)) current))
+      (let [^APersistentVector$SubVector sub result]
+        (.slice ^PVector (.-pv ^PersistentPVector (.-v sub)) (long (.-start sub)) (long (.-end sub))))
       (sequential? result) (.-pv ^PersistentPVector (into (empty wrapped-current) result))
       :else (throw (ex-info "a vector ref's swap function must return a vector" {:returned (type result)})))
     :blob
@@ -458,11 +597,18 @@
   (or (:pdt system)
       (throw (ex-info "no persistent data trees: start the peer with {:pdt true}" {:keys (keys system)}))))
 
-(defn- ->kind [kind]
-  (let [k (keyword kind)]
-    (when-not (#{:map :set :vector :blob :tree} k)
-      (throw (ex-info "a ref kind is :map, :set, :vector, :blob, or :tree" {:kind kind})))
-    k))
+(defn- ->kind
+  "A ref kind as a keyword: one of the value kinds, or, where `text?`, `:text` too."
+  ([kind] (->kind kind false))
+  ([kind text?]
+   (let [k (keyword kind)]
+     (cond
+       (#{:map :set :vector :blob :tree} k) k
+       (and text? (= :text k)) k
+       :else (throw (ex-info (if text?
+                               "a ref kind is :map, :set, :vector, :blob, :tree, or :text"
+                               "a ref kind is :map, :set, :vector, :blob, or :tree")
+                             {:kind kind}))))))
 
 (defn- java-ref ^Ref [^Pdt pdt ^String name kind]
   (case kind
@@ -473,15 +619,22 @@
     :tree (.treeRef pdt name)))
 
 (defn ref
-  "The ref of a name and kind (`:map`, `:set`, `:vector`, `:blob`, or `:tree`)
-  on the system's ref space: an `IDeref` and `IRef`, so `@r` is the merged
-  value of its heads and `add-watch` hears each new head (PD-R-07). One handle
-  per name is kept on the system; the four-argument form names the ref space,
-  which must be the one `:pdt {:space ..}` configured (\"pdt\" by default)."
+  "The ref of a name and kind (`:map`, `:set`, `:vector`, `:blob`, `:tree`,
+  or `:text`, a map of texts) on the system's ref space: an `IDeref` and
+  `IRef`, so `@r` is the merged value of its heads and `add-watch` hears each
+  new head (PD-R-07). One handle per name is kept on the system; the
+  four-argument form names the ref space, which must be the one
+  `:pdt {:space ..}` configured (\"pdt\" by default)."
   ([system name kind]
-   (let [kind (->kind kind)
+   (let [kind (->kind kind true)
          handles (:pdt-refs system)
-         make (fn [] (->PdtRef (java-ref (facade system) (str name) kind) kind (wrap-for kind) (atom {}) (atom nil)))]
+         make (fn []
+                (if (= :text kind)
+                  ;; PDT 2 phase 7, P2-C-04: the values pass through PText.codec, so the heads are version 2
+                  (let [conv (text-conv (replica system))]
+                    (->PdtRef (.mapRef (facade system) (str name) object-codec ^Codec (:values conv)) kind
+                              (fn [v] (->PersistentPMap v conv nil)) (atom {}) (atom nil)))
+                  (->PdtRef (java-ref (facade system) (str name) kind) kind (wrap-for kind) (atom {}) (atom nil))))]
      (if handles
        (or (get @handles [(str name) kind])
            (get (clojure.core/swap! handles (fn [m] (if (get m [(str name) kind]) m (assoc m [(str name) kind] (make)))))
@@ -610,6 +763,73 @@
      :nodes-dropped (.nodesDropped s) :heads-rewritten (.headsRewritten s) :bases-fetched (.basesFetched s)
      :nodes-held (.nodesHeld s) :bytes-held (.bytesHeld s)}))
 
+;; ------------------------------------------------------------------ content stores (PDT 2 phase 7, P2-C-04)
+
+(defn- need
+  "The planner's need of a pin: the copies, and the tier, the price, and the
+  stores to avoid when given. The facade reads the size and the sealing from
+  the root."
+  ^StoreChooser$Need [{:keys [copies tier max-price avoid] :or {copies 1}}]
+  (let [^StoreChooser$Need n (StoreChooser$Need/of 0 (int copies))
+        ^StoreChooser$Need n (if tier (.tier n (name tier)) n)
+        ^StoreChooser$Need n (if max-price (.maxPrice n (long max-price)) n)]
+    (if (seq avoid) (.avoid n (set (map core/peer-id avoid))) n)))
+
+(defn store-pin!
+  "Asks the group's content stores to hold a root (P2-S-11): a tree root
+  this peer holds complete, such as `(root @r)`, or the root of an artifact
+  this peer published or fetched. The planner chooses stores from their
+  cards, and the facade writes one signed pin that names them; a store
+  charges only the member that signed (§3.2.2). Pinning the same root again
+  renews the lease (P2-S-04). Options: `:copies` (1), `:lease` (\"30d\"),
+  `:tier` (:hot or :cold), `:max-price` (per GiB-month), and
+  `:avoid` [peer-id ..]. Returns {:root :kind :lease :copies :stores}, the
+  lease in seconds and the stores' peer ids. Throws `IllegalStateException`
+  when this peer does not hold the root or no store's card fits; cards
+  arrive through discovery, so a caller that pins as its fleet starts may
+  find none yet and pins again later."
+  ([system root] (store-pin! system root {}))
+  ([system root {:keys [lease] :or {lease "30d"} :as opts}]
+   (let [^Stores$Pinning p (.storeFor (facade system) (str root) (need opts) (core/duration lease))
+         ^StorePin pin (.pin p)]
+     {:root (.root pin) :kind (keyword (.kind pin)) :lease (.lease pin) :copies (.copies pin)
+      :stores (mapv (fn [^AssetCard c] (.value (.issuer c))) (.chosen p))})))
+
+(defn store-status
+  "What the content stores hold of a root, as this peer sees it (P2-S-07):
+  {:root :copies :holders [{:store :bytes :until :blind}] :unplaced}.
+  `:copies` counts the live receipts of stores this peer has not struck, and
+  `:until` is the epoch millisecond a receipt lapses. `:unplaced` is true
+  when this peer struck a store that held the root and found no other store
+  to place it on, so it wrote no pin (§10.11)."
+  [system root]
+  (let [^Stores stores (.stores (facade system))
+        receipts (.receipts stores (str root))]
+    {:root (str root)
+     :copies (count receipts)
+     :holders (mapv (fn [^StoreReceipt r]
+                      {:store (.value (.holder r)) :bytes (.bytes r) :until (.until r) :blind (.blind r)})
+                    receipts)
+     :unplaced (contains? (.unplaced stores) (str root))}))
+
+(defn challenge!
+  "Makes a store prove it holds a root (P2-S-07): random picks of the root go
+  to the store (a peer id), which must answer each within the facade's
+  challenge deadline (`:pdt {:challenge-deadline \"2s\"}`). Returns a future
+  of {:store :root :picks :proven :passed :reason :elapsed-ms}, which
+  settles by that deadline whatever the store does; deref it, with a timeout
+  of your own if you wish. A member at feature level 1 fails at once. Two
+  failures in a row on one root strike the store: its receipts stop counting
+  in `store-status`, and this peer pins what it pinned there on another
+  store."
+  ^CompletableFuture [system root store]
+  (.thenApply (.challenge (facade system) (str root) (core/peer-id store))
+              (reify Function
+                (apply [_ r]
+                  (let [^Content$ChallengeResult r r]
+                    {:store (.value (.holder r)) :root (.root r) :picks (.picks r) :proven (.proven r)
+                     :passed (.passed r) :reason (.reason r) :elapsed-ms (.elapsed r)})))))
+
 ;; ------------------------------------------------------------------ building (fleet/start)
 
 (defn- ->path ^Path [p]
@@ -639,12 +859,17 @@
   (:full or :lazy), `:sealing`, `:retain {:versions 64 :age \"1h\"}`,
   `:head-lease` (\"10m\"), `:refs {name {:mode :multi|:linear}}`,
   `:take {:lease :timeout :retries}`, `:cancel-grace`, `:collect-every`
-  (\"1m\", 0 disables), `:collector-visits`."
+  (\"1m\", 0 disables), `:collector-visits`, `:challenge-deadline` (\"2s\").
+  The identity signs the pins `store-pin!` writes, and the discovery holds
+  the content stores' cards (P2-C-04)."
   ^Pdt [{:keys [store inline-delta load-timeout follow sealing retain head-lease refs take cancel-grace
-                collect-every collector-visits]}
-        ^Space ref-space group-name]
+                collect-every collector-visits challenge-deadline]}
+        ^Space ref-space group-name ^PeerIdentity identity ^DiscoveryService discovery]
   (let [^Pdt$Builder builder (-> (Pdt/builder ref-space)
-                    (.store (if (instance? NodeStore store) store (node-store (or store {}) group-name))))]
+                    (.store (if (instance? NodeStore store) store (node-store (or store {}) group-name)))
+                    (.identity identity))]
+    (when discovery (.discovery builder discovery))
+    (when challenge-deadline (.challengeDeadline builder (core/duration challenge-deadline)))
     (when inline-delta (.inlineDelta builder (int (if (number? inline-delta) inline-delta
                                                       (let [[_ n unit] (re-matches #"(?i)\s*(\d+)\s*(B|KiB|MiB|KB|MB)?\s*" (str inline-delta))]
                                                         (when-not n (throw (ex-info "not a byte size" {:value inline-delta})))
