@@ -188,7 +188,7 @@ Each key registers one layer-4 service on the facade (the starter's
 fixed member list, which is why `:ordered` names the members: generate the
 identities first and pass each peer the same list, as the test does.
 
-The content swarm (`srad/large-networks-bulk-data.md`) is the fourth key beside
+The content swarm (SPEC annex G) is the fourth key beside
 `:capabilities`: `:content true` gives a group a `content` space, a file store
 under `~/.agentspaces/content/<group>`, and the `aspace:cap/content-swarm`
 capability; a 3 GiB `write!` into any space becomes an artifact whose pieces

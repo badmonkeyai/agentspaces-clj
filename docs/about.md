@@ -19,7 +19,7 @@ from your `~/.m2` after a `mvn install` of the core when you work against an
 unreleased version.
 
 The bindings track the AgentSpaces specification,
-[SPEC v0.1.23](https://github.com/badmonkeyai/agentspaces-spec/blob/main/SPEC.md).
+[SPEC v0.1.33](https://github.com/badmonkeyai/agentspaces-spec/blob/main/SPEC.md).
 Each section below names the clause it exposes as "SPEC §", and the mapping
 table at the end names the Spring starter property each config key mirrors.
 
