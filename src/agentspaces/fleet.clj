@@ -281,8 +281,82 @@
 
 ;; ------------------------------------------------------------------ node
 
+(defn- ->bytes-size
+  "A byte count from a number or a \"4MiB\" / \"256KiB\" / \"10GiB\" string."
+  [v]
+  (cond
+    (nil? v) nil
+    (number? v) (long v)
+    :else (let [[_ n unit] (re-matches #"(?i)\s*(\d+)\s*(B|KiB|MiB|GiB|KB|MB|GB)?\s*" (str v))]
+            (when-not n (throw (ex-info "not a byte size" {:value v})))
+            (* (Long/parseLong n)
+               (case (some-> ^String unit .toLowerCase) ("kib" "kb") 1024 ("mib" "mb") (* 1024 1024)
+                     ("gib" "gb") (* 1024 1024 1024) 1)))))
+
+;; The keys of the starter's strict agentspaces.gossip and agentspaces.space blocks
+;; (srad/replication-by-entry.md appendix D). A misspelt pace would otherwise be ignored
+;; silently, so an unknown key refuses at start and names the keys the block takes, as the
+;; starter does (RE-Q-MNT-04).
+(def ^:private gossip-keys #{:audit :audit-sessions :audit-budget :probe-hash-streams})
+(def ^:private space-keys #{:horizon :renew-shortening-log})
+
+(defn- refuse-unknown-keys [block known m]
+  (when (some? m)
+    (when-not (map? m)
+      (throw (ex-info (str block " takes a map of " (str/join ", " (map name (sort known))))
+                      {:block block :value m})))
+    (doseq [k (keys m)]
+      (when-not (contains? known k)
+        (throw (ex-info (str block " " k " is not a key this binding knows; " block " takes "
+                             (str/join ", " (sort known)))
+                        {:block block :key k :known (sort known)}))))))
+
+(defn- ->horizon
+  "true for :per-entry (the default), false for :legacy; the starter spells them the same."
+  [v]
+  (case (when (or (keyword? v) (string? v)) (name v))
+    "per-entry" true
+    "legacy" false
+    (throw (ex-info ":space :horizon must be :per-entry or :legacy" {:value v}))))
+
+(defn- ->flag
+  "A boolean key's value. Anything but true or false refuses, since (boolean \"false\") is true
+  and a quoted flag would otherwise turn a switch on."
+  [block k v]
+  (if (boolean? v)
+    v
+    (throw (ex-info (str block " " k " must be true or false") {:key k :value v}))))
+
+(defn- ->whole
+  [block k v]
+  (if (integer? v)
+    v
+    (throw (ex-info (str block " " k " must be a whole number") {:key k :value v}))))
+
+(defn- replication
+  "Applies `:gossip` and `:space` to the node builder. Each key the map leaves out keeps the
+  core's default, so a config without either block builds the node it always did. The node
+  builder judges the ranges and names the key when a value is outside them."
+  [^PeerNode$Builder builder gossip space]
+  (refuse-unknown-keys ":gossip" gossip-keys gossip)
+  (refuse-unknown-keys ":space" space-keys space)
+  (let [{:keys [audit audit-sessions audit-budget probe-hash-streams]} gossip]
+    (when (some? audit)
+      (.audit builder (boolean (->flag ":gossip" :audit audit))))
+    (when (some? audit-sessions)
+      (.auditSessions builder (int (->whole ":gossip" :audit-sessions audit-sessions))))
+    (when (some? audit-budget)
+      (.auditBudget builder (long (->bytes-size audit-budget))))
+    (when (some? probe-hash-streams)
+      (.probeHashStreams builder (int (->whole ":gossip" :probe-hash-streams probe-hash-streams)))))
+  (when (some? (:horizon space))
+    (.horizon builder (boolean (->horizon (:horizon space)))))
+  (when (some? (:renew-shortening-log space))
+    (.renewShorteningLog builder (boolean (->flag ":space" :renew-shortening-log (:renew-shortening-log space))))))
+
 (defn- build-node
-  ^PeerNode [{:keys [roles require-attestation multicast revocation-validator security peer-ad-interval lazy-push appcard-level]}
+  ^PeerNode [{:keys [roles require-attestation multicast revocation-validator security peer-ad-interval lazy-push appcard-level
+                     gossip space]}
              {:keys [channel-auth]} ^PeerIdentity identity]
   (let [^PeerNode$Builder builder
         (-> (PeerNode/builder identity)
@@ -298,6 +372,7 @@
       (.lazyPush builder (boolean lazy-push)))
     (when appcard-level
       (.appCardLevel builder (int appcard-level)))
+    (replication builder gossip space)
     (when multicast
       (let [{:keys [group interval] :or {group "239.255.42.99:7787" interval "5s"}}
             (if (map? multicast) multicast {})]
@@ -624,18 +699,6 @@
 
 ;; ------------------------------------------------------------- content swarm
 
-(defn- ->bytes-size
-  "A byte count from a number or a \"4MiB\" / \"256KiB\" / \"10GiB\" string."
-  [v]
-  (cond
-    (nil? v) nil
-    (number? v) (long v)
-    :else (let [[_ n unit] (re-matches #"(?i)\s*(\d+)\s*(B|KiB|MiB|GiB|KB|MB|GB)?\s*" (str v))]
-            (when-not n (throw (ex-info "not a byte size" {:value v})))
-            (* (Long/parseLong n)
-               (case (some-> ^String unit .toLowerCase) ("kib" "kb") 1024 ("mib" "mb") (* 1024 1024)
-                     ("gib" "gb") (* 1024 1024 1024) 1)))))
-
 (defn- content-store
   "The piece store of `:content {:store {:backends [:file :memory :in-place] :path .. :quota ..}}`;
   default one file backend under `~/.agentspaces/content/<group>`."
@@ -915,6 +978,28 @@
                    \"30s\"; newcomers get it directly in between (peer-ad-interval-millis)
     :appcard-level the AppCard level advertised as wire.appcard, 2 by default; 1
                    advertises no hint, so a test builds a mixed fleet (SPEC §6.1a.2)
+    :gossip        {:audit true :audit-sessions 4 :audit-budget \"1MiB\"
+                    :probe-hash-streams 32}: how members reconcile a space
+                   (agentspaces.gossip.*, srad/replication-by-entry.md appendix
+                   D). :audit (on by default) advertises wire.ae=2 and audits
+                   a space by its fingerprinted trie toward members that also
+                   advertise it (SPEC annex I.6), fetching only the entries
+                   that differ; off, the peer reconciles as a 0.6.0 member
+                   does. :audit-sessions is 1 to 4 per asker, :audit-budget the
+                   bytes each answer may hold (4KiB to 4MiB), and
+                   :probe-hash-streams how many streams a probe hashes one by
+                   one (0 to 256). An unknown key refuses at start
+    :space         {:horizon :per-entry :renew-shortening-log true}
+                   (agentspaces.space.*). :horizon :per-entry (the default)
+                   advertises wire.horizon=1, so a space whose whole view
+                   advertises it forgets a withdrawn entry by the entry's own
+                   lease, no sooner than its expiry plus the clock-drift
+                   bound (SPEC §7.3); :legacy keeps 2 x maxLease. Set :legacy
+                   on a peer that renews for an identity another peer renews
+                   for at the same time. :renew-shortening-log logs, once per
+                   space, the first renewal asking for less than the lease has
+                   left (such a renewal changes nothing, see
+                   agentspaces.space/renew!). An unknown key refuses at start
     :ad-cache-max-entries, :ad-cache-max-bytes  the advertisement cache's two
                    bounds, by default 8192 and 33554432 (times four on a
                    rendezvous) (discovery.cache.max-entries, .max-bytes)

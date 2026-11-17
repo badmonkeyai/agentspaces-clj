@@ -20,6 +20,11 @@ Written for: Clojure developers who build with agentspaces-clj.
 | `:multicast` | `multicast.{enabled, group, interval-millis}` | `true` or a map; also a join locator |
 | `:lazy-push` | `lazy-push` | default `true` |
 | `:peer-ad-interval` | `peer-ad-interval-millis` | default `"30s"` |
+| `:gossip {:audit}` | `gossip.audit` | default `true`: advertise `wire.ae=2` and audit spaces by their fingerprinted tries (SPEC annex I.6) |
+| `:gossip {:audit-sessions :audit-budget}` | `gossip.audit-sessions`, `gossip.audit-budget` | default `4` (1 to 4) and `"1MiB"` (4KiB to 4MiB; a number is bytes) |
+| `:gossip {:probe-hash-streams}` | `gossip.probe-hash-streams` | default `32` (0 to 256) |
+| `:space {:horizon}` | `space.horizon` | `:per-entry` (default) advertises `wire.horizon=1`; `:legacy` keeps 2 x maxLease |
+| `:space {:renew-shortening-log}` | `space.renew-shortening-log` | default `true`: log the first renewal that asks for less than the lease has left |
 | `:card-refresh` | `card-refresh-millis` | default `"5m"` |
 | `:agents` | none (the starter always creates discovery) | `true` switches discovery on for bound agents with no capability |
 | `:capabilities {..}` | `capabilities.*` | §10.2 |

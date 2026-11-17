@@ -33,6 +33,9 @@ A fuller member, showing every top-level key:
    :tick     "250ms"                      ; protocol round period
    :lazy-push true                        ; the self-pruning gossip tree (false: random fan-out only)
    :peer-ad-interval "30s"                ; how often the self-advertisement is re-flooded
+   :gossip   {:audit true                 ; audit spaces by their tries toward members that do too
+              :audit-budget "1MiB"}       ; the bytes each audit answer may hold
+   :space    {:horizon :per-entry}        ; forget a withdrawn entry by its own lease (:legacy: 2 x maxLease)
    :card-refresh "5m"                     ; how often bound cards and capability ads re-publish, §10
    :security {:profile :mtls}             ; §4 below
    :transport :tls                        ; §5 below; the profile already implies it
@@ -69,3 +72,21 @@ A fuller member, showing every top-level key:
 
 Only `:group` is required. Every other key has a default that matches the
 starter, with one deliberate exception described in §11.
+
+`:gossip` and `:space` hold the replication settings of the starter's
+`agentspaces.gossip.*` and `agentspaces.space.*` (§12 lists every key). Most
+peers leave both out:
+
+- `:gossip {:audit true}`, the default, advertises `wire.ae=2`. Toward a member
+  that advertises it too, the peer compares a space by its fingerprinted trie
+  and fetches only the entries that differ (SPEC annex I.6). Toward an older
+  member it reconciles as before.
+- `:space {:horizon :per-entry}`, the default, advertises `wire.horizon=1`.
+  Once every member of a space's view advertises it, a withdrawn entry is
+  forgotten by its own lease: its expiry plus ten minutes, instead of its
+  expiry plus twice the longest lease the space has seen (SPEC §7.3).
+- Set `:horizon :legacy` on a peer that renews entries for an identity another
+  peer renews at the same time. The hint promises one renewing node per
+  identity.
+- An unknown key in either map refuses at start and names the keys it takes,
+  so a misspelt setting never passes silently.

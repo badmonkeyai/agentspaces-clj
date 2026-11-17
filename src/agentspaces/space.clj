@@ -47,13 +47,18 @@
   for tests and REPL exploration.
 
       (local \"work\")
-      (local \"work\" {:issuer my-agent-id :sweep-every \"1s\"})"
+      (local \"work\" {:issuer my-agent-id :sweep-every \"1s\"})
+
+  `:renew-shortening-log false` stops the one log line a renewal for less
+  than its lease has left writes; such renewals are counted either way
+  (`.renewShortenings`)."
   (^LocalSpace [name] (local name {}))
-  (^LocalSpace [name {:keys [issuer sweep-every clock]}]
+  (^LocalSpace [name {:keys [issuer sweep-every clock renew-shortening-log]}]
    (let [issuer (or issuer (AgentId. (PeerId/of "zCljLocalPeer1") "clj"))
          builder (LocalSpace/builder name issuer)]
      (when sweep-every (.sweepEvery builder (core/duration sweep-every)))
      (when clock (.clock builder clock))
+     (when (some? renew-shortening-log) (.renewShorteningLog builder (boolean renew-shortening-log)))
      (.build builder))))
 
 (defn as
@@ -202,7 +207,23 @@
                   (core/lease lease))))))
 
 (defn renew!
-  "Extends a write handle's or take result's lease."
+  "Extends a write handle's or take result's lease to at least `extension`
+  from now. It never shortens a lease: the new expiry is the later of the
+  current one and now plus `extension` (SPEC §7.2), so renewing for less than
+  the lease has left succeeds and changes nothing. To end an entry sooner,
+  `cancel!` it, and `write!` it again with the shorter lease if it should
+  stay. To give a taken entry back early, let its take lease lapse.
+
+  Only the entry's issuer renews a written entry, and only while it is
+  present and unexpired: a gone or lapsed entry throws
+  LeaseExpiredException, and another agent's entry throws
+  IllegalStateException. A renewal for less than the lease has left is
+  counted, and logged once per space unless the space was built with the log
+  off (`:space {:renew-shortening-log false}` in agentspaces.fleet/start,
+  `{:renew-shortening-log false}` in `local`).
+
+      (renew! handle \"10m\")   ; at least ten minutes from now
+      (renew! task \"5m\")      ; a take! result: its take lease"
   [handle-or-entry extension]
   (let [d (core/duration extension)]
     (if (instance? EntryHandle handle-or-entry)
@@ -210,7 +231,8 @@
       (.renew (taken handle-or-entry) d))))
 
 (defn cancel!
-  "Withdraws a written entry through its handle."
+  "Withdraws a written entry through its handle. This is how an entry ends
+  before its lease does, since `renew!` never shortens a lease."
   [^EntryHandle handle]
   (.cancel handle))
 

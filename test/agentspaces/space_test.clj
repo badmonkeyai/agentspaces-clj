@@ -162,3 +162,58 @@
       (space/renew! handle "20m")
       (space/cancel! handle)
       (is (empty? (space/read-all s Fixtures$TaskEntry))))))
+
+(deftest renew-never-shortens-and-cancel-is-how-an-entry-ends-sooner
+  ;; SPEC §7.2 (v0.1.35): the new expiry is the later of the current one and
+  ;; now plus the extension, so renew! cannot shorten a lease (RE-L-04). The
+  ;; test reads the lease read-entries reports as :expires-at, which moves with
+  ;; a renewal since LocalSpace keeps its record's lease with the expiry
+  ;; (RESUME-RBE core item a), and checks by a wait that the entries live by it.
+  (with-open [s (space/local "clj-renew-contract" {:renew-shortening-log false :sweep-every "100ms"})]
+    (let [present? (fn [topic] (some #(= topic (:topic %)) (space/read-all s Fixtures$TaskEntry)))
+          expires-at (fn [topic] (some #(when (= topic (:topic (:value %))) (:expires-at %))
+                                       (space/read-entries s Fixtures$TaskEntry)))
+          long-lived (space/write! s Fixtures$TaskEntry {:topic "long" :priority 1} {:lease "1h"})
+          short-lived (space/write! s Fixtures$TaskEntry {:topic "short" :priority 1} {:lease "500ms"})]
+      (testing "a shorter renewal succeeds and leaves the lease as it was"
+        (let [before (expires-at "long")]
+          (is (some? before))
+          (space/renew! long-lived "100ms")
+          (is (= 1 (.renewShortenings s)) "the shortening renewal is counted")
+          (is (= before (expires-at "long")) "the reported expiry did not move")))
+      (testing "a longer renewal extends a lease"
+        (let [before (expires-at "short")
+              ;; whole milliseconds, as the space's clock reads them
+              floor (.plus (Instant/ofEpochMilli (System/currentTimeMillis)) (Duration/ofHours 1))]
+          (space/renew! short-lived "1h")
+          (let [after (expires-at "short")
+                ceiling (.plus (Instant/ofEpochMilli (System/currentTimeMillis)) (Duration/ofHours 1))]
+            (is (.isAfter after before) "the reported expiry moved later")
+            (is (not (.isBefore after floor)) "at least an hour from the renewal")
+            (is (not (.isAfter after ceiling)) "and no more than an hour from now"))))
+      (Thread/sleep 1200)
+      (is (present? "long") "still there well past the 100 ms the shorter renewal asked for")
+      (is (present? "short") "still there past its written 500 ms")
+      (testing "a caller that wants a shorter lease cancels and writes again"
+        (space/cancel! long-lived)
+        (is (not (present? "long")))
+        (space/write! s Fixtures$TaskEntry {:topic "long" :priority 1} {:lease "300ms"})
+        (is (present? "long"))
+        (Thread/sleep 1200)
+        (is (not (present? "long")) "the rewrite lapsed with its shorter lease"))
+      (testing "a cancelled entry is gone, so renewing it throws"
+        (is (thrown? ai.badmonkey.agentspaces.api.error.LeaseExpiredException
+                     (space/renew! long-lived "1h")))))))
+
+(deftest a-take-renewal-never-shortens-its-take-lease
+  (with-open [s (space/local "clj-renew-take" {:sweep-every "200ms"})]
+    (space/write! s Fixtures$TaskEntry {:topic "held" :priority 1} {:lease "1h"})
+    (let [task (space/take! s Fixtures$TaskEntry {:lease "1h"})]
+      (is (some? task))
+      ;; One second would let the take lapse almost at once; the hold keeps its hour, so
+      ;; the entry stays taken past that second instead of reappearing.
+      (space/renew! task "1s")
+      (Thread/sleep 1500)
+      (is (nil? (space/read s Fixtures$TaskEntry)) "still taken after the shorter renewal")
+      (space/complete! s task)
+      (is (nil? (space/read s Fixtures$TaskEntry))))))

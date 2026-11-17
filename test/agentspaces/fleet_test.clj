@@ -363,3 +363,33 @@
       (finally
         (fleet/stop! b)
         (fleet/stop! a)))))
+
+(deftest the-gossip-and-space-blocks-set-the-replication-hints
+  ;; srad/replication-by-entry.md appendix D: :gossip and :space mirror the starter's
+  ;; agentspaces.gossip.* and agentspaces.space.* and refuse an unknown key (RE-L-04).
+  (let [hints (fn [config]
+                (let [sys (fleet/start (merge {:bind (str "127.0.0.1:" (free-port))
+                                               :tick "200ms"
+                                               :group (group-config "clj-hints" nil {})}
+                                              config))]
+                  (try (into {} (.wireHints ^PeerNode (:node sys)))
+                       (finally (fleet/stop! sys)))))]
+    (testing "by default a peer audits (wire.ae=2) and collects by the entry's own lease (wire.horizon=1)"
+      (let [h (hints {})]
+        (is (= "2" (get h PeerNode/AE_HINT)))
+        (is (= "1" (get h PeerNode/HORIZON_HINT)))))
+    (testing ":audit false and :horizon :legacy advertise neither hint"
+      (let [h (hints {:gossip {:audit false :audit-sessions 2 :audit-budget "64KiB"
+                               :probe-hash-streams 16}
+                      :space {:horizon :legacy :renew-shortening-log false}})]
+        (is (not (contains? h PeerNode/AE_HINT)))
+        (is (not (contains? h PeerNode/HORIZON_HINT)))))
+    (testing "an unknown or misspelt key refuses at start and names the keys the block takes"
+      (let [e (is (thrown? ExceptionInfo (hints {:gossip {:audit-budjet "1MiB"}})))]
+        (is (str/includes? (ex-message e) ":audit-budget")))
+      (is (thrown? ExceptionInfo (hints {:space {:horizon-mode :legacy}})))
+      (is (thrown? ExceptionInfo (hints {:space {:horizon :per-node}})))
+      (is (thrown? ExceptionInfo (hints {:gossip {:audit "false"}}))))
+    (testing "the node builder judges the ranges"
+      (is (thrown? IllegalArgumentException (hints {:gossip {:audit-sessions 5}})))
+      (is (thrown? IllegalArgumentException (hints {:gossip {:audit-budget "8MiB"}}))))))

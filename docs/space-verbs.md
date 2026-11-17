@@ -21,6 +21,23 @@ lease is the entry's time to live; an unrenewed entry vanishes.
 (space/cancel! h)
 ```
 
+`renew!` extends a lease to at least the given time from now. It never
+shortens one (SPEC §7.2):
+
+- The new expiry is the later of the current one and now plus the extension.
+- A renewal for less than the lease has left succeeds and changes nothing.
+  The space counts it and logs the first one, so a caller that relied on
+  shortening shows up.
+- To end an entry sooner, `cancel!` it. To keep it with a shorter lease,
+  cancel it and `write!` it again.
+- Only the entry's issuer renews it, and only while it is present and
+  unexpired. A renewal of a cancelled, completed, or lapsed entry throws
+  `LeaseExpiredException`; another agent's renewal throws
+  `IllegalStateException`.
+
+A take result's `renew!` works the same way on its take lease: to give a task
+back early, let the take lease lapse.
+
 **Read.** Non-destructive; returns a map, or nil when nothing matches within
 `:timeout` (default: no waiting). Within one entry type, reads and takes
 prefer the oldest matching entry (SPEC §7.2, first in first out). `:fresh

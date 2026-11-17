@@ -3,6 +3,25 @@
 What changed in the bindings, newest first. The Java core's history is in
 the root `CHANGELOG.md` of the AgentSpaces workspace.
 
+## Unreleased: replication by entry
+
+The bindings follow the core's replication-by-entry work
+(srad/replication-by-entry.md, RE-L-04, SPEC v0.1.35). Three new tests.
+
+- **Renewal never shortens.** `space/renew!` now documents the SPEC §7.2
+  rule the core enforces: the new expiry is the later of the current one and
+  now plus the extension. A renewal for less than the lease has left succeeds
+  and changes nothing, and the space counts it. To end an entry sooner,
+  `cancel!` it; to keep it with a shorter lease, cancel it and write it
+  again. `space/local` takes `:renew-shortening-log false` to stop the one
+  log line such a renewal writes.
+- **The replication settings.** `fleet/start` takes `:gossip {:audit
+  :audit-sessions :audit-budget :probe-hash-streams}` and `:space {:horizon
+  :renew-shortening-log}`, the starter's `agentspaces.gossip.*` and
+  `agentspaces.space.*`. The defaults advertise `wire.ae=2` (the audit) and
+  `wire.horizon=1` (the per-entry horizon). An unknown key refuses at start
+  and names the keys the block takes.
+
 ## Unreleased: 0.6.0
 
 The bindings move to version 0.6.0 with the AgentSpaces core and build on

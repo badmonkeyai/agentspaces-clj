@@ -70,6 +70,9 @@ and re-offered by anti-entropy once the credential lands.
 (space/revoke! (fleet/space issuer "partner") (fleet/writer member))
 ```
 
+`renew!` on a credential's handle extends it and never shortens it
+(§8). To end a credential sooner, `revoke!` it.
+
 Scopes are `:write`, `:take`, or both; a completion requires `:take`. Only
 the issuer's node may `grant!` or `revoke!`; any other node gets a
 `SpaceAdmissionException`.

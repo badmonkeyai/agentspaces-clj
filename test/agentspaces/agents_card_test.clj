@@ -62,7 +62,7 @@
       (let [{:keys [ui]} (agents/card (agents/bind! a (->Desk)))
             plain (agents/card (agents/bind! a (->Clerk)))]
         (is (= "a2ui" (:protocol ui)))
-        (is (= "v0.9.1" (:version ui)))
+        (is (= "1.0" (:version ui)))
         (is (= [{:id "ask" :catalog-id "example-widgets" :component "MessageInput" :entry "" :controls ["file"] :role "control"}]
                (:components ui)))
         (is (= ["example-widgets"] (:catalog-ids ui)))

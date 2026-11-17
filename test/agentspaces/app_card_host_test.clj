@@ -32,7 +32,7 @@
 (defn- plain-card []
   (AppCard. "aspace://zApps/app/zPeerA/support-chat" (PeerId/of "zPeerA") (GroupId/of "zApps") at
             (Duration/ofMinutes 15) "Support chat" "fed" "a2ui" "support" ["zApps/conversations"] ["ask"] "" "" "" "1"
-            ["conversations"] (AppCard$Ui. "a2ui" "v0.9.1" ["example-widgets" "agentspaces-viz"] "summariser" "views" ["chat-1"])))
+            ["conversations"] (AppCard$Ui. "a2ui" "1.0" ["example-widgets" "agentspaces-viz"] "summariser" "views" ["chat-1"])))
 
 (deftest the-host-is-appended-last-and-matches-the-java-vector
   (let [codec (CborCodec/defaultCodec)

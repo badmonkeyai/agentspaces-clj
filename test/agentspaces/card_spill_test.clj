@@ -43,7 +43,7 @@
     (-> (AppCard. (str "aspace://" (.value group) "/app/" (.value peer) "/board") peer group (Instant/now)
                   (Duration/ofMinutes 15) "board" "fed" "a2ui" "example" [] [] "" "" "" "1"
                   (mapv #(str "view-" % "-" (apply str (repeat 1100 "x"))) (range AppCard/MAX_TERMS))
-                  (AppCard$Ui. "a2ui" "v0.9.1" ["example-widgets"] "board" "views" ["board-1"]))
+                  (AppCard$Ui. "a2ui" "1.0" ["example-widgets"] "board" "views" ["board-1"]))
         (.withOrigin (agents/app-card-origin {:system "console" :ref "example-console/board"}))
         (.withFormats ["application/geo+json"]))))
 
