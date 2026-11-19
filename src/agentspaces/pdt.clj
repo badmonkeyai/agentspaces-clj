@@ -837,19 +837,23 @@
 
 (defn node-store
   "The node store of `:pdt {:store {:kind :pack|:memory :path ..}}`
-  (appendix C `store.kind`, `store.path`): a pack store under the path, by
-  default `~/.agentspaces/pdt/<group>`, or a memory store. A quota is not
-  applied here: the quota store wraps the node store and cannot yet sit under
-  the swarm (SRAD §10.3)."
-  ^NodeStore [{:keys [kind path] :or {kind :pack}} group-name]
-  (let [clock (InstantSource/system)
-        ^BlockStore backend (case (keyword kind)
-                              :memory (MemoryBlockStore.)
-                              :pack (PackNodeStore/open
-                                     (->path (or path (str (System/getProperty "user.home") "/.agentspaces/pdt/"
-                                                           (.replaceAll ^String (str group-name) "[^A-Za-z0-9._-]" "_")))))
-                              (throw (ex-info ":pdt :store :kind is :pack or :memory" {:kind kind})))]
-    (NodeStore. backend clock)))
+  (appendix C `store.kind`, `store.path`): a pack store under the path, or a
+  memory store. With no path the default is `~/.agentspaces/pdt/<group>/<peer>`
+  when the peer id is given: one directory serves one store (PackNodeStore
+  refuses a second), and several peers of a group may share a host. A quota is
+  not applied here: the quota store wraps the node store and cannot yet sit
+  under the swarm (SRAD §10.3)."
+  (^NodeStore [opts group-name] (node-store opts group-name nil))
+  (^NodeStore [{:keys [kind path] :or {kind :pack}} group-name peer-id]
+   (let [clock (InstantSource/system)
+         safe (fn [x] (.replaceAll ^String (str x) "[^A-Za-z0-9._-]" "_"))
+         default (str (System/getProperty "user.home") "/.agentspaces/pdt/" (safe group-name)
+                      (when peer-id (str "/" (safe peer-id))))
+         ^BlockStore backend (case (keyword kind)
+                               :memory (MemoryBlockStore.)
+                               :pack (PackNodeStore/open (->path (or path default)))
+                               (throw (ex-info ":pdt :store :kind is :pack or :memory" {:kind kind})))]
+     (NodeStore. backend clock))))
 
 (defn build
   "The `Pdt` facade of a `:pdt` block over the ref space (SRAD §7.2, appendix
@@ -866,7 +870,7 @@
                 collect-every collector-visits challenge-deadline]}
         ^Space ref-space group-name ^PeerIdentity identity ^DiscoveryService discovery]
   (let [^Pdt$Builder builder (-> (Pdt/builder ref-space)
-                    (.store (if (instance? NodeStore store) store (node-store (or store {}) group-name)))
+                    (.store (if (instance? NodeStore store) store (node-store (or store {}) group-name (some-> identity .peerId .value))))
                     (.identity identity))]
     (when discovery (.discovery builder discovery))
     (when challenge-deadline (.challengeDeadline builder (core/duration challenge-deadline)))
