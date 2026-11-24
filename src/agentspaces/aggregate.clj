@@ -19,7 +19,11 @@
   settled estimates, and a settle listener.
 
       (aggregate/start! system \"load\" 12.5)
-      (aggregate/await-settled system \"load\" {:ticks 3 :tolerance 0.01 :timeout \"20s\"})"
+      (aggregate/await-settled system \"load\" {:settle \"3s\" :tolerance 0.01 :timeout \"20s\"})
+
+  A settle rule is `:settle`, a duration the estimate must hold within
+  `:tolerance` (as Java's `Settle.after(Duration)` and `@OnEstimate(settle =
+  \"PT3S\")`), or the older `:ticks`, read as that many rounds of about a second."
   (:require [agentspaces.core :as core])
   (:import (ai.badmonkey.agentspaces.capabilities.aggregate PushSumAggregate PushSumAggregate$Estimate
                                                             PushSumAggregate$Mode PushSumAggregate$Settle)
@@ -35,8 +39,15 @@
 (defn- ->mode ^PushSumAggregate$Mode [kw]
   (PushSumAggregate$Mode/valueOf (.toUpperCase (name (or kw :avg)))))
 
-(defn- settle ^PushSumAggregate$Settle [{:keys [ticks tolerance] :or {ticks 0 tolerance 0.0}}]
-  (PushSumAggregate$Settle/after (int ticks) (double tolerance)))
+(defn- settle
+  "The rule: `:settle` (a duration, \"8s\" or \"PT8S\") or `:ticks` (rounds of about a second,
+  srad/agentspaces-event-loop.md EL-T-06); naming both is refused. Neither: the first estimate."
+  ^PushSumAggregate$Settle [{:keys [ticks tolerance] span :settle :or {tolerance 0.0}}]
+  (when (and span ticks)
+    (throw (ex-info "a settle rule names both :settle and :ticks; choose one" {:settle span :ticks ticks})))
+  (if span
+    (PushSumAggregate$Settle/after (core/duration span) (double tolerance))
+    (PushSumAggregate$Settle/after (int (or ticks 0)) (double tolerance))))
 
 (defn- estimate->map [^PushSumAggregate$Estimate e]
   {:epoch (.epochId e) :mode (keyword (.toLowerCase (.name (.mode e)))) :value (.value e) :ticks (.ticks e)})
@@ -57,14 +68,14 @@
 
 (defn tick!
   "One protocol round of the aggregate, for peers that drive it by hand
-  (the node's tick drives it under `fleet/start`)."
+  (under `fleet/start` the node loop runs the rounds at their deadlines)."
   [system]
   (.tick (capability system)))
 
 (defn await-settled
-  "Blocks until the epoch's estimate holds for `:ticks` consecutive ticks
-  within `:tolerance` (defaults 0 and 0: the first estimate), or `:timeout`
-  (default \"30s\") passes; the value, or nil."
+  "Blocks until the epoch's estimate holds for `:settle` (a duration) or
+  `:ticks` rounds within `:tolerance` (defaults: the first estimate, 0), or
+  `:timeout` (default \"30s\") passes; the value, or nil."
   [system epoch {:keys [timeout] :or {timeout "30s"} :as rule}]
   (let [done (promise)
         handle (.onEstimate (capability system)

@@ -20,7 +20,7 @@ Written for: Clojure developers who build with agentspaces-clj.
 | `:discovery` | the `DiscoveryService`, when `:advertise`, `:agents`, `:capabilities`, `:content`, `:content-key`, or `:content-key-rotation` is set |
 | `:facade` `:group-context` | the `AgentSpaces` facade and this group's context: agents bind through them |
 | `:capabilities` | the layer-4 providers the `:capabilities` block registered, by key |
-| `:card-refresher` | the daemon scheduler that re-publishes bound cards and capability advertisements every `:card-refresh` (default `"5m"`); `fleet/stop!` shuts it down |
+| `:card-refresher` | re-publishes bound cards and capability advertisements every `:card-refresh` (default `"5m"`), a one-shot on the node's time source re-armed after each run; deref it for `{:running :refreshes}`; `fleet/stop!` closes it |
 | `:content` `:content-space` | the content swarm and its space, under `:content` |
 | `:key-ring` `:key-wrap` | the group's content-key ring and its distributor, under `:content-key` |
 | `:founding` | the `SignedGroupAdvertisement`, when this node founded the group |
@@ -175,7 +175,7 @@ Each key registers one layer-4 service on the facade (the starter's
 | Namespace | What it does |
 |---|---|
 | `agentspaces.vote` | `propose!` (idempotent on the id), `cast!` (refused for a peer the `:vote` grant leaves out, as every member's tally would drop its ballot), `proposal`, `tally`, `decision`, `on-decision!` (`{:lease "1h" :renew true}`: the subscription renews at half-life until closed) |
-| `agentspaces.aggregate` | `start!` (`:mode` `:avg`, `:sum`, `:count`, `:min`, `:max`), `estimate`, `await-settled` (`{:ticks :tolerance :timeout}`), `on-estimate!` |
+| `agentspaces.aggregate` | `start!` (`:mode` `:avg`, `:sum`, `:count`, `:min`, `:max`), `estimate`, `await-settled` (`{:settle :tolerance :timeout}`, `:settle` a duration such as `"8s"`; `:ticks` is the older count of 1 s rounds), `on-estimate!` |
 | `agentspaces.ordered` | `take!` through the log (exactly once across the members), `complete!`, `leader?` |
 | `agentspaces.semantic` | `query`, `remote-query`: cards ranked by meaning |
 | `agentspaces.learn` | `start!`, `model`, `round`, `end-epoch!` (evaluations as `{:model-id :epoch :loss :content-id}`, written into the metrics space) |

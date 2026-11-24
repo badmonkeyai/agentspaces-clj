@@ -77,7 +77,7 @@
   "Makes this peer a content store: a `ContentStore` over the facade, which
   `agentspaces.pdt/attach!` joined to a swarm at feature level 2, publishing
   its card through the discovery, taking the pins its policy admits, and
-  ticking on the group tick. `:name` names the store (the peer id when nil).
+  running its own deadlines on the node loop. `:name` names the store (the peer id when nil).
   A `:grant` store asks the authorizer; with none it takes no pins and its
   card says it waits for one. Returns {:store ContentStore :tick
   AutoCloseable}."
@@ -88,10 +88,11 @@
         _ (when authorizer (.authorizer builder authorizer))
         ^ContentStore store (.build builder)]
     (.start store)
-    {:store store :tick (.onTick runtime (fn [] (.tick store)))}))
+    ;; its own deadlines on the node loop, as the starter does (srad/agentspaces-event-loop.md EL-T-09)
+    {:store store :tick (.joinLoop store runtime)}))
 
 (defn close!
-  "Closes a store `start!` started, and its tick registration."
+  "Closes a store `start!` started, and its loop registration."
   [{:keys [^ContentStore store ^java.lang.AutoCloseable tick]}]
   (when tick (try (.close tick) (catch Exception _)))
   (when store (try (.close store) (catch Exception _)))

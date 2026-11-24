@@ -66,12 +66,13 @@
            (ai.badmonkey.agentspaces.content CompositeStore Content Content$Builder ContentSpillStore ContentPolicy ContentPolicy$SeedMode
                                              FilePieceStore InPlaceStore MemoryPieceStore PieceStore SpacePayloads)
            (ai.badmonkey.agentspaces.content.tree TreeStore)
-           (ai.badmonkey.agentspaces.peering.membership GroupMembership$Config
+           (ai.badmonkey.agentspaces.common.time TimeSource TtlFloor)
+           (ai.badmonkey.agentspaces.peering.membership GroupMembership GroupMembership$Config
                                                         GroupScopedAuthorizer
                                                         MembershipAuthorizer)
            (ai.badmonkey.agentspaces.peering.node FoundingTimeoutException GroupFounding GroupRuntime
                                                   JoinCredentials PeerNode
-                                                  PeerNode$Builder PeerNode$ChannelAuth
+                                                  PeerNode$Builder PeerNode$ChannelAuth PeerNode$Escalation
                                                   SignedGroupAdvertisement)
            (ai.badmonkey.agentspaces.peering.transport TcpTransport TlsTcpTransport)
            (ai.badmonkey.agentspaces.space DiscoveryPublisher)
@@ -86,7 +87,7 @@
            (java.security.cert CertificateFactory X509Certificate X509CRL)
            (java.time Duration Instant InstantSource)
            (java.util Base64)
-           (java.util.concurrent Executors ScheduledExecutorService TimeoutException TimeUnit)
+           (java.util.concurrent TimeoutException)
            (java.util.function BiConsumer Predicate ToDoubleFunction)))
 
 (set! *warn-on-reflection* true)
@@ -190,6 +191,13 @@
                             (when (or oidc? (:authorizer security)) (.membership runtime))
                             (.peerId identity))))
 
+(defn- clock-of
+  "The peer's one time source (srad/agentspaces-event-loop.md EL-C-06): the node's, which `start` puts under
+  ::time once the node is built (the `:time` option, or the system's), so every builder below reads the clock the
+  node runs on and a test's VirtualTime reaches all of them."
+  ^InstantSource [config]
+  (or (::time config) (TimeSource/system)))
+
 (defn- agent-identities
   "The agent identity factory `:agent-keys` selects (SPEC 4.2, v0.1.13), as
   the starter's agentspaces.identity.*: `:peer` (default) signs agents with
@@ -197,7 +205,7 @@
   of its own (with a certified X25519 key, SPEC 11a.2a), persisted under
   `:agent-keystore` when set, each certificate lasting `:agent-certificate-ttl`
   (default \"24h\")."
-  [{:keys [agent-keys agent-keystore agent-certificate-ttl] :or {agent-certificate-ttl "24h"}}
+  [{:keys [agent-keys agent-keystore agent-certificate-ttl] :or {agent-certificate-ttl "24h"} :as config}
    ^PeerIdentity identity]
   (case (or agent-keys :peer)
     :peer (do (when agent-keystore
@@ -207,7 +215,7 @@
               (fn [agent-name] (.agentIdentity identity ^String agent-name)))
     :subordinate
     (let [ttl (core/duration agent-certificate-ttl)
-          clock (InstantSource/system)
+          clock (clock-of config)
           store (when agent-keystore (AgentKeystore/at (->path agent-keystore)))]
       (memoize
        (fn [agent-name]
@@ -356,7 +364,7 @@
 
 (defn- build-node
   ^PeerNode [{:keys [roles require-attestation multicast revocation-validator security peer-ad-interval lazy-push appcard-level
-                     gossip space]}
+                     gossip space time watchdog]}
              {:keys [channel-auth]} ^PeerIdentity identity]
   (let [^PeerNode$Builder builder
         (-> (PeerNode/builder identity)
@@ -366,6 +374,12 @@
                             :signed PeerNode$ChannelAuth/SIGNED))
             (.roles (->roles roles))
             (.requireAttestation (boolean require-attestation)))]
+    (when time
+      ;; one time source for the node and everything start builds over it (EL-C-06): VirtualTime in a test
+      (.time builder ^TimeSource time))
+    (when-let [escalation (:escalation watchdog)]
+      ;; agentspaces.watchdog.escalation, as the starter sets it (EL-H-08): "report" (the default) or "exit"
+      (.watchdogEscalation builder (PeerNode$Escalation/parse (name escalation))))
     (when peer-ad-interval
       (.peerAdInterval builder (core/duration peer-ad-interval)))
     (when (some? lazy-push)
@@ -374,7 +388,9 @@
       (.appCardLevel builder (int appcard-level)))
     (replication builder gossip space)
     (when multicast
-      (let [{:keys [group interval] :or {group "239.255.42.99:7787" interval "5s"}}
+      ;; the core's default interval, 1 min: announce at the join, then after 1, 2, 10 and 20 min (SPEC §10.1,
+      ;; EL-O-11); a 5 s beacon sent 396 datagrams per group per 33 minutes on a quiet LAN against 4
+      (let [{:keys [group interval] :or {group "239.255.42.99:7787" interval "60s"}}
             (if (map? multicast) multicast {})]
         (.multicast builder (->socket-address group) (core/duration interval))))
     (when revocation-validator
@@ -444,9 +460,17 @@
                        " is :policy #{:open :invite})")))
   (or membership-tuning membership))
 
-(defn- membership-config ^GroupMembership$Config
-  [{:keys [ttl probe indirect] :or {ttl "30s" probe "2s" indirect 2}}]
-  (GroupMembership$Config. (core/duration ttl) (core/duration probe) (int indirect)))
+(defn- membership-config
+  "The SWIM settings of `:membership-tuning`. Without `:ttl` the member TTL is the core's default, the 45 s floor
+  with this node's own keepalive inside 30 s (GroupMembership.Config.defaults(), SPEC §5.2, decision 17); a given
+  `:ttl` is the explicit form, which keeps the keepalive inside that TTL, as Java's three-argument Config does."
+  ^GroupMembership$Config
+  [{:keys [ttl probe indirect] :or {probe "2s" indirect 2}}]
+  (let [defaults (GroupMembership$Config/defaults)]
+    (if ttl
+      (GroupMembership$Config. (core/duration ttl) (core/duration probe) (int indirect))
+      (GroupMembership$Config. (.memberTtl defaults) (core/duration probe) (int indirect)
+                               (.probeInterval defaults) (.keepaliveTtl defaults) (.cycleFactor defaults)))))
 
 (defn- ->group-id
   "A GroupId from an instance, an \"aspace://<id>\" URI, or the bare id."
@@ -680,9 +704,9 @@
     (when ring
       (let [pipes (CapabilityPipes. runtime codec)
             keys (if-let [keystore (:keystore config)]
-                   (GroupKeyDistributor. pipes (.peerId identity) codec (InstantSource/system)
+                   (GroupKeyDistributor. pipes (.peerId identity) codec (clock-of config)
                                          (FileKeystore/encryptionKeys (->path keystore)))
-                   (GroupKeyDistributor. pipes (.peerId identity) codec (InstantSource/system)))]
+                   (GroupKeyDistributor. pipes (.peerId identity) codec (clock-of config)))]
         (.serve keys ring authorizer (.id runtime))
         (.follow keys ring discovery)
         (when rotate-every
@@ -703,9 +727,8 @@
   "The piece store of `:content {:store {:backends [:file :memory :in-place] :path .. :quota ..}}`;
   default one file backend under `~/.agentspaces/content/<group>`."
   ^PieceStore [{:keys [backends path quota cache-external]
-                :or {backends [:file] cache-external false}} group-name codec]
+                :or {backends [:file] cache-external false}} group-name codec ^InstantSource clock]
   (let [quota (or (->bytes-size quota) (* 10 1024 1024 1024))
-        clock (InstantSource/system)
         dir (->path (or path (str (System/getProperty "user.home") "/.agentspaces/content/"
                                   (.replaceAll ^String group-name "[^A-Za-z0-9._-]" "_"))))
         built (mapv (fn [kind]
@@ -741,7 +764,7 @@
     ;; the capability runtime the swarm registers with.
     (let [{:keys [space escalate-above holding-lease] :or {space "content" escalate-above "4MiB" holding-lease "5m"}} content-config
           content-space (build-space context {:name space :settle "200ms"})
-          store (content-store (:store content-config) (get-in config [:group :name]) codec)
+          store (content-store (:store content-config) (get-in config [:group :name]) codec (clock-of config))
           builder (-> (Content/builder (.pipes group) runtime content-space (.peerId identity))
                       (.codec codec)
                       (.store store)
@@ -776,7 +799,7 @@
   ^DiscoveryService [config ^GroupRuntime runtime ^CborCodec codec ^PeerIdentity identity]
   (let [roles (->roles (:roles config))
         {:keys [ad-cache-max-entries ad-cache-max-bytes spill-max-fetch-bytes]} config
-        clock (InstantSource/system)
+        clock (clock-of config)
         cache (AdCache. codec clock
                         (int (or ad-cache-max-entries (DiscoveryService/cacheBoundFor roles)))
                         (long (or ad-cache-max-bytes (DiscoveryService/cacheBytesFor roles))))]
@@ -812,12 +835,18 @@
   cheap when unused. `start` adds the spaces once the content swarm, which
   needs the facade's pipes, exists."
   [config ^PeerIdentity identity agents ^GroupRuntime runtime discovery]
-  (let [facade (AgentSpaces. identity (InstantSource/system)
+  (let [facade (AgentSpaces. identity (clock-of config)
                              (reify AgentIdentityFactory
                                (identityFor [_ agent-name] (agents agent-name))))
         _ (when-let [reg (:schema-registry config)] (.schemaRegistry facade ^SchemaRegistry reg))
         group-name (get-in config [:group :name])
         ^AgentSpaces$GroupContext group (.register facade group-name (.id runtime) runtime discovery)]
+    ;; srad/agentspaces-event-loop.md §10.33: what the starter sets on each group's binder, set here too, so a
+    ;; defagent's verb leases meet the TTL floor (EL-E-03) and :watchdog {:hold-limit} stops a hung handler's renewal
+    (when-let [floor (::ttl-floor config)]
+      (.ttlFloor (.binder group) ^TtlFloor floor))
+    (when-let [limit (get-in config [:watchdog :hold-limit])]
+      (.holdLimit (.binder group) (core/duration limit)))
     (when discovery
       (.capabilities group (CapabilityRuntime. runtime discovery identity)))
     {:facade facade :group group}))
@@ -845,12 +874,12 @@
   counts and casts under the profile's authorizer, so a `:vote` grant is
   enforced as in the starter. `start` switches discovery on whenever
   `:capabilities` is set."
-  [{:keys [capabilities]} {:keys [^AgentSpaces$GroupContext group]}
+  [{:keys [capabilities] :as config} {:keys [^AgentSpaces$GroupContext group]}
    ^GroupRuntime runtime ^PeerIdentity identity ^Authorizer authorizer discovery ^CborCodec codec
    agent-name spaces]
   (when (seq capabilities)
     (let [pipes (.pipes group)
-          clock (InstantSource/system)
+          clock (clock-of config)
           space-named (fn [k space-name]
                         (or (get spaces space-name)
                             (throw (ex-info (str ":capabilities " k " names a space this peer"
@@ -902,25 +931,58 @@
 ;; ---------------------------------------------------------------- start
 
 (defn- card-refresher
-  "A daemon scheduler that re-publishes every bound card and capability
-  advertisement each `period` (the starter's AgentSpacesLifecycle), so
-  neither lapses at the 15-minute card TTL; `stop!` shuts it down. A failed
-  refresh is logged and the schedule goes on."
-  ^ScheduledExecutorService [^AgentSpaces facade ^Duration period]
-  (let [scheduler (Executors/newSingleThreadScheduledExecutor
-                   (reify java.util.concurrent.ThreadFactory
-                     (newThread [_ task]
-                       (doto (Thread. ^Runnable task "agentspaces-card-refresh")
-                         (.setDaemon true)))))
-        millis (.toMillis period)]
-    (.scheduleAtFixedRate scheduler
-                          (fn []
-                            (try (.refreshCards facade)
-                                 (catch RuntimeException e
-                                   (.log log java.lang.System$Logger$Level/WARNING
-                                         "card refresh failed" ^Throwable e))))
-                          millis millis TimeUnit/MILLISECONDS)
-    scheduler))
+  "Re-publishes every bound card and capability advertisement each `period`
+  (the starter's AgentSpacesLifecycle), so neither lapses at the 15-minute
+  card TTL. One one-shot at a time on the node's time source, re-armed after
+  each run (srad/agentspaces-event-loop.md EL-T-12, EL-T-13, EL-X-03): no
+  thread of its own, no fixed rate, and VirtualTime drives it in a test.
+  Returns an AutoCloseable that `stop!` closes; deref it for {:running
+  :refreshes}. A failed refresh is logged and the next one is armed."
+  [^AgentSpaces facade ^TimeSource time ^Duration period]
+  (let [running (atom true)
+        refreshes (atom 0)
+        task (atom nil)
+        arm (fn arm []
+              (locking running
+                (when @running
+                  (reset! task
+                          (.schedule time period
+                                     ^Runnable (fn []
+                                                 (try (.refreshCards facade)
+                                                      (swap! refreshes inc)
+                                                      (catch RuntimeException e
+                                                        (.log log java.lang.System$Logger$Level/WARNING
+                                                              "card refresh failed" ^Throwable e))
+                                                      (finally (arm)))))))))]
+    (arm)
+    (reify
+      java.lang.AutoCloseable
+      (close [_]
+        (locking running
+          (reset! running false)
+          (when-let [^ai.badmonkey.agentspaces.common.time.TimeSource$Scheduled t @task]
+            (.cancel t))))
+      clojure.lang.IDeref
+      (deref [_] {:running @running :refreshes @refreshes}))))
+
+(defn- check-ttls!
+  "The TTL floor (srad/agentspaces-event-loop.md EL-E-03, EL-E-04), as the starter
+  runs it at start: each configured TTL against its registered default, which
+  passes silently; any other value under 60 s warns, or under `:ttl {:strict
+  true}` refuses to start, unless `:ttl {:expert-overrides {\"<key>\" \"reason\"}}`
+  names its key. The keys are the starter's property names."
+  [{:keys [ttl group content]}]
+  (let [{:keys [strict expert-overrides]} ttl
+        floor (TtlFloor/of (boolean strict)
+                           (into {} (map (fn [[k v]] [(name k) (str v)])) expert-overrides))
+        member-ttl (:ttl (membership-tuning group))
+        holding (when (map? content) (:holding-lease content))]
+    (.check floor "agentspaces.membership.member-ttl"
+            (if member-ttl (core/duration member-ttl) GroupMembership/MEMBER_TTL_FLOOR)
+            GroupMembership/MEMBER_TTL_FLOOR)
+    (when holding
+      (.check floor "agentspaces.content.holding-lease" (core/duration holding) (Duration/ofMinutes 5)))
+    floor))
 
 (defn start
   "Starts one peer and returns the system map {:identity :node :runtime
@@ -971,7 +1033,20 @@
     :keystore      a directory path for a persistent identity (keystore)
     :bind          \"host:port\" to listen on; omit for a dial-only peer (bind)
     :roles         a set like #{:relay :rendezvous} (roles)
-    :tick          protocol round period, default \"250ms\" (tick-millis)
+    :tick          the cadence of the deprecated onTick adapters, default \"250ms\"
+                   (tick-millis); since 0.7.0 it no longer paces the node, whose
+                   loop runs each piece of due work at its own deadline
+    :time          the node's TimeSource (default the system's): every builder
+                   start makes reads it, so a test passes a VirtualTime and moves
+                   protocol time with no real wait (EL-C-06)
+    :ttl           {:strict false :expert-overrides {\"<property>\" \"reason\"}}:
+                   the TTL floor (agentspaces.ttl.*): a TTL under 60 s warns, or
+                   refuses to start when strict, unless an override names it;
+                   the floor also judges every bound agent's verb leases
+    :watchdog      {:escalation :report|:exit :hold-limit \"5m\"}
+                   (agentspaces.watchdog.*): :exit ends the process when the
+                   watchdog escalates; :hold-limit stops renewing the take of an
+                   ordered handler held past it (off by default)
     :lazy-push         false to gossip with random fan-out only, instead of the
                    self-pruning tree toward members that understand it (default true)
     :peer-ad-interval  how often the self-advertisement is re-flooded, default
@@ -1067,7 +1142,7 @@
                     :bootstrap     {:require false :refresh-min .. :refresh-max ..
                                     :trace false :first-wins false :timeout \"3s\"}:
                                    the chain's LocatePolicy and shape (bootstrap.*)
-                    :membership-tuning  {:ttl \"30s\" :probe \"2s\" :indirect 2}, the
+                    :membership-tuning  {:ttl \"45s\" :probe \"2s\" :indirect 2}, the
                                    SWIM settings (:membership is a deprecated alias)
                     :content-key   32 bytes, their Base64, or a GroupKey;
                                    encrypts every space (content-key)
@@ -1100,9 +1175,12 @@
     (throw (ex-info "a :store needs :pdt, the persistent data trees it holds roots of" {:keys (keys config)})))
   (let [config (if (and (:pdt config) (not (:content config))) (assoc config :content true) config)
         store-policy (when-let [store (:store config)] ((store-fn 'policy) store))
+        config (assoc config ::ttl-floor (check-ttls! config))
         identity (->identity config)
         {:keys [transport channel-auth profile] :as posture} (posture config)
         node (build-node config posture identity)
+        ;; the node's time source is every builder's from here on (EL-C-06)
+        config (assoc config ::time (.time node))
         transport-instance (->transport transport identity tls)]
     (when-let [token (get-in config [:security :token])]
       (.credentialHint node JoinCredentials/OIDC_HINT_KEY token))
@@ -1165,7 +1243,7 @@
          :agents agents :key-ring ring :key-wrap key-wrap
          :facade (:facade facade) :group-context (:group facade)
          :capabilities capabilities
-         :card-refresher (card-refresher (:facade facade) (core/duration card-refresh))
+         :card-refresher (card-refresher (:facade facade) (.time node) (core/duration card-refresh))
          :content (:content content) :content-space (:space content)
          :pdt (:pdt pdt) :pdt-space (:space pdt) :pdt-space-name (:space-name pdt)
          :pdt-tick pdt-tick :pdt-refs (when pdt (atom {}))
@@ -1293,7 +1371,7 @@
                                                             " :content-key")
                                                        {})))
          epoch (.rotate keys ^PeerIdentity (:identity system)
-                        (.plus (Instant/now) (core/duration cutover-delay)))]
+                        (.plus (.instant (.time ^PeerNode (:node system))) (core/duration cutover-delay)))]
      (when-not (get-in system [:config :keystore])
        (.log log java.lang.System$Logger$Level/WARNING
              ^String (str "rotated the content key of group '" (get-in system [:config :group :name])
@@ -1306,13 +1384,31 @@
   [system]
   (.id (.advertisement ^GroupRuntime (:runtime system))))
 
+(defn- health-map [^ai.badmonkey.agentspaces.peering.node.NodeLoop$Health h]
+  {:state (keyword (.toLowerCase (.name (.state h)))) :reasons (vec (.reasons h))})
+
+(defn loop-health
+  "The node loop's health as its watchdog judges it (srad/agentspaces-event-loop.md
+  EL-H-08, EL-H-14): {:state :ok|:degraded|:down :reasons [..]}. A host with a
+  liveness probe reports :down as not live, as the starter's LoopLiveness does;
+  one with none starts with `:watchdog {:escalation :exit}`."
+  [{:keys [^PeerNode node]}]
+  (health-map (.loopHealth node)))
+
+(defn on-loop-health!
+  "Calls (f health-map) on each change of `loop-health`. It runs on the loop's or
+  the watchdog's thread and must be quick."
+  [{:keys [^PeerNode node]} f]
+  (.onLoopHealth node (reify java.util.function.Consumer
+                        (accept [_ h] (f (health-map h))))))
+
 (defn stop!
   "Closes the system's card refresher, spaces and node. Idempotent enough
   for shutdown hooks."
   [{:keys [^PeerNode node spaces ^Content content ^ReplicatedSpace content-space
-           ^ScheduledExecutorService card-refresher pdt pdt-tick ^ReplicatedSpace pdt-space store store-tick]}]
+           ^java.lang.AutoCloseable card-refresher pdt pdt-tick ^ReplicatedSpace pdt-space store store-tick]}]
   (when card-refresher
-    (try (.shutdownNow card-refresher) (catch Exception _)))
+    (try (.close card-refresher) (catch Exception _)))
   (when store
     ((store-fn 'close!) {:store store :tick store-tick}))
   (when pdt

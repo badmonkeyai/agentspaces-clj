@@ -28,8 +28,8 @@
            (java.util Arrays)))
 
 (defn- free-port []
-  (with-open [socket (ServerSocket. 0)]
-    (.getLocalPort socket)))
+  ;; the shared allocator never hands one port out twice in a run (srad/agentspaces-event-loop.md §10.5)
+  (ai.badmonkey.agentspaces.test.Ports/free))
 
 (defn- config [group port seed-port extra]
   (merge {:bind (str "127.0.0.1:" port)

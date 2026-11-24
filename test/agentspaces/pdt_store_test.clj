@@ -16,8 +16,8 @@
            (java.net ServerSocket)))
 
 (defn- free-port []
-  (with-open [socket (ServerSocket. 0)]
-    (.getLocalPort socket)))
+  ;; the shared allocator never hands one port out twice in a run (srad/agentspaces-event-loop.md §10.5)
+  (ai.badmonkey.agentspaces.test.Ports/free))
 
 (defn- await-truthy [timeout-ms f]
   (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
@@ -34,7 +34,7 @@
           :group {:name group
                   :founding (str group "-v1")
                   :seeds (if seed-port [(str "127.0.0.1:" seed-port)] [])
-                  :membership-tuning {:ttl "30s" :probe "2s" :indirect 2}
+                  :membership-tuning {:probe "2s" :indirect 2}
                   :spaces [{:name "work" :settle "150ms"}]}}
          extra))
 

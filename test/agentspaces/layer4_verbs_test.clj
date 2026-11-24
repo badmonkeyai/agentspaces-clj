@@ -30,8 +30,8 @@
            (java.net ServerSocket)))
 
 (defn- free-port []
-  (with-open [socket (ServerSocket. 0)]
-    (.getLocalPort socket)))
+  ;; the shared allocator never hands one port out twice in a run (srad/agentspaces-event-loop.md §10.5)
+  (ai.badmonkey.agentspaces.test.Ports/free))
 
 (defn- await-truthy [timeout-ms f]
   (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
@@ -48,7 +48,7 @@
           :group {:name group
                   :founding (str group "-v1")
                   :seeds (if seed-port [(str "127.0.0.1:" seed-port)] [])
-                  :membership-tuning {:ttl "30s" :probe "2s" :indirect 2}
+                  :membership-tuning {:probe "2s" :indirect 2}
                   :spaces spaces}}
          extra))
 
@@ -94,7 +94,7 @@
 
 (defagent Gauge
   {:description "Records a settled fleet estimate" :goals ["gauge"]}
-  (on-estimate settled [^PushSumAggregate$Estimate e] {:prefix "load" :settle-ticks 3 :tolerance 0.01
+  (on-estimate settled [^PushSumAggregate$Estimate e] {:prefix "load" :settle "PT3S" :tolerance 0.01
                                                        :result-space "findings"}
     ^Fixtures$FindingEntry
     (Fixtures$FindingEntry. (:epochId e) (str (Math/round ^double (:value e))))))

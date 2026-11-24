@@ -25,20 +25,14 @@
   (:import (ai.badmonkey.agentspaces.api.space Lease Subscription)
            (ai.badmonkey.agentspaces.capabilities.vote VoteCapability VoteCapability$Decision
                                                        VoteCapability$Proposal)
-           (java.util.concurrent Executors ScheduledExecutorService ScheduledFuture TimeUnit)
-           (java.util.function Consumer Predicate)))
+           (ai.badmonkey.agentspaces.common.time Periodic TimeSource)
+           (ai.badmonkey.agentspaces.peering.node PeerNode)
+           (java.time Duration)
+           (java.util.function BooleanSupplier Consumer Predicate)))
 
 (set! *warn-on-reflection* true)
 
 (def ^:private ^java.lang.System$Logger log (System/getLogger "agentspaces.vote"))
-
-(defonce ^:private ^ScheduledExecutorService renewals
-  ;; One daemon thread per process renews every on-decision! subscription at half-life.
-  (Executors/newSingleThreadScheduledExecutor
-   (reify java.util.concurrent.ThreadFactory
-     (newThread [_ task]
-       (doto (Thread. ^Runnable task "agentspaces-vote-renewals")
-         (.setDaemon true))))))
 
 (defn- capability ^VoteCapability [system]
   (or (get-in system [:capabilities :vote])
@@ -86,7 +80,8 @@
   "Calls `(f decision-map)` once per proposal whose id passes `pred` when
   it closes; returns the subscription (close it to stop). Options:
   `:lease` (default \"1h\") is the subscription lease, and `:renew` (default
-  true) renews it at half-life on a daemon scheduler, so a listener outlives
+  true) renews it at half-life on the node's time source (a task, not a
+  thread of its own; srad/agentspaces-event-loop.md EL-W-02), so a listener outlives
   its lease until closed; `:renew false` lets it lapse with the lease.
 
       (vote/on-decision! system #(str/starts-with? % \"council:\") handle-decision)
@@ -100,17 +95,19 @@
                                           (reify Consumer (accept [_ d] (f (decision->map d))))
                                           lease)
          half (max 1 (quot (.toMillis (.duration lease)) 2))
-         ^ScheduledFuture renewal
+         ^TimeSource time (if-let [^PeerNode node (:node system)] (.time node) (TimeSource/system))
+         ^Periodic renewal
          (when renew
-           (.scheduleAtFixedRate renewals
-                                 (fn []
-                                   (try (.renew inner (.duration lease))
-                                        (catch RuntimeException e
-                                          (.log log java.lang.System$Logger$Level/WARNING
-                                                "on-decision! renewal failed" ^Throwable e))))
-                                 half half TimeUnit/MILLISECONDS))]
+           (Periodic/every time (Duration/ofMillis half) "vote-on-decision-renew"
+                           (reify BooleanSupplier
+                             (getAsBoolean [_]
+                               (try (.renew inner (.duration lease))
+                                    (catch RuntimeException e
+                                      (.log log java.lang.System$Logger$Level/WARNING
+                                            "on-decision! renewal failed" ^Throwable e)))
+                               true))))]
      (reify Subscription
        (renew [_ extension] (.renew inner extension))
        (close [_]
-         (when renewal (.cancel renewal false))
+         (when renewal (.close renewal))
          (.close inner))))))

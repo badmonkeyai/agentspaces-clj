@@ -35,8 +35,8 @@
            (java.net ServerSocket)))
 
 (defn- free-port []
-  (with-open [socket (ServerSocket. 0)]
-    (.getLocalPort socket)))
+  ;; the shared allocator never hands one port out twice in a run (srad/agentspaces-event-loop.md §10.5)
+  (ai.badmonkey.agentspaces.test.Ports/free))
 
 (defn- await-truthy [timeout-ms f]
   (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
@@ -53,7 +53,7 @@
           :group {:name group
                   :founding (str group "-v1")
                   :seeds (if seed-port [(str "127.0.0.1:" seed-port)] [])
-                  :membership-tuning {:ttl "30s" :probe "2s" :indirect 2}
+                  :membership-tuning {:probe "2s" :indirect 2}
                   :spaces spaces}}
          extra))
 
@@ -143,9 +143,15 @@
         spaces [{:name "orders" :settle "150ms"}]
         caps (fn [seed] {:capabilities {:ordered {:space "orders" :members members :seed seed}}})
         a (fleet/start (assoc (config "clj-ord" port-a nil spaces (caps 1)) :identity id-a))
-        b (fleet/start (assoc (config "clj-ord" port-b port-a spaces (caps 2)) :identity id-b))]
+        b (fleet/start (assoc (config "clj-ord" port-b port-a spaces (caps 2)) :identity id-b))
+        leader-known? (fn [system]
+                        (.isPresent (.leader (.raft ^ai.badmonkey.agentspaces.capabilities.orderedlog.OrderedTakes
+                                                    (get-in system [:capabilities :ordered])))))]
     (try
-      (Thread/sleep 2500)
+      ;; Wait for the log to elect, not a fixed 2.5 s: each drain stops at its first empty take, and on 0.7.0 the
+      ;; election timeout is a fixed 1.25 to 2.25 s (owner decision 2), so two members whose first votes go out before
+      ;; their link is up elect after a few seconds. The fixed sleep raced that and both drains ended empty.
+      (is (await-truthy 30000 #(and (leader-known? a) (leader-known? b))) "the ordered log elects a leader")
       (doseq [i (range 4)]
         (space/write! (fleet/space a "orders") Fixtures$TaskEntry {:topic (str "order-" i) :priority i} {:lease "10m"}))
       (let [taken (atom [])

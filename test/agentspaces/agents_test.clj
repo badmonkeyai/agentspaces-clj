@@ -39,8 +39,8 @@
            (java.util.logging Handler Logger)))
 
 (defn- free-port []
-  (with-open [socket (ServerSocket. 0)]
-    (.getLocalPort socket)))
+  ;; the shared allocator never hands one port out twice in a run (srad/agentspaces-event-loop.md §10.5)
+  (ai.badmonkey.agentspaces.test.Ports/free))
 
 (defn- await-truthy [timeout-ms f]
   (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]

@@ -16,7 +16,7 @@
 (ns agentspaces.learn
   "Gossip learning (SPEC §8.5) over a `fleet/start` system with
   `:capabilities {:learn true}`: models as double vectors merged by weight
-  averaging across the group, round by round on the node's tick. `end-epoch!`
+  averaging across the group, a round every second at its deadline on the node loop. `end-epoch!`
   writes its evaluations into a metrics space, so it needs the fuller shape
   `{:learn {:metrics \"metrics\" :metrics-lease \"1h\"}}`; under `:learn true`
   it throws an IllegalStateException naming the missing space."

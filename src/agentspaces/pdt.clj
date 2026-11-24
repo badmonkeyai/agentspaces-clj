@@ -895,15 +895,16 @@
 
 (defn attach!
   "Joins the facade to the content swarm built with its tree store, starts it,
-  and runs its tick on the group tick. Returns the tick registration, an
+  and joins it to the node loop (its own deadlines). Returns the loop registration, an
   `AutoCloseable`."
   ^java.lang.AutoCloseable [^Pdt pdt ^Content content ^GroupRuntime runtime]
   (.attach pdt content)
   (.start pdt)
-  (.onTick runtime (fn [] (.tick pdt))))
+  ;; its own deadlines on the node loop, as the starter does (srad/agentspaces-event-loop.md EL-T-08)
+  (.joinLoop pdt runtime))
 
 (defn close!
-  "Closes the facade and its tick registration, and the store's backend when it
+  "Closes the facade and its loop registration, and the store's backend when it
   is a pack store."
   [^Pdt pdt ^java.lang.AutoCloseable tick]
   (when tick (try (.close tick) (catch Exception _)))

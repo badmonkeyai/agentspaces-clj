@@ -62,9 +62,14 @@ receiver verifies it exactly as it verifies a gossiped advertisement before
 introducing itself. Nothing unauthenticated is ever acted on.
 
 ```clojure
-{:multicast true}                                          ; 239.255.42.99:7787 every 5 s
+{:multicast true}                                          ; 239.255.42.99:7787, the default 1 min interval
 {:multicast {:group "239.255.42.99:7787" :interval "2s"}}
 ```
+
+The beacon announces at the join, then retries after 1, 2, 10 and 20 minutes
+and starts again from 1 minute, the same table the Java peers use (SPEC §10.1).
+A configured `:interval` scales the table. The default was `"5s"` before
+0.7.0; a quiet LAN now carries 4 datagrams per group per 33 minutes, not 396.
 
 With `:multicast` on, the beacon is also a locator in the group's bootstrap
 chain (§6), so a `:join` by id with no seeds finds its founding through the

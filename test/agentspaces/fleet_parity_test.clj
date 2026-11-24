@@ -36,12 +36,12 @@
            (ai.badmonkey.agentspaces.test Fixtures$FindingEntry Fixtures$TaskEntry)
            (clojure.lang ExceptionInfo)
            (java.net ServerSocket)
-           (java.time Instant)
-           (java.util.concurrent ScheduledExecutorService)))
+           (ai.badmonkey.agentspaces.test VirtualTime)
+           (java.time Duration Instant)))
 
 (defn- free-port []
-  (with-open [socket (ServerSocket. 0)]
-    (.getLocalPort socket)))
+  ;; the shared allocator never hands one port out twice in a run (srad/agentspaces-event-loop.md §10.5)
+  (ai.badmonkey.agentspaces.test.Ports/free))
 
 (defn- await-truthy [timeout-ms f]
   (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
@@ -59,7 +59,7 @@
            :group (merge {:name group
                           :founding (str group "-v1")
                           :seeds (if seed-port [(str "127.0.0.1:" seed-port)] [])
-                          :membership-tuning {:ttl "30s" :probe "2s" :indirect 2}
+                          :membership-tuning {:probe "2s" :indirect 2}
                           :spaces [{:name "work" :settle "150ms"}]}
                          group-extra)}
           extra)))
@@ -112,19 +112,79 @@
           (.issued)))
 
 (deftest card-refresh-re-publishes-a-bound-agents-card
-  (let [a (fleet/start (config "clj-card-refresh" (free-port) nil {:agents true :card-refresh "200ms"}))
+  ;; srad/agentspaces-event-loop.md EL-T-12, EL-T-13, EL-C-06: the refresh is a one-shot on the node's time
+  ;; source, re-armed after each run, so virtual time drives it and no thread of its own exists
+  (let [vt (VirtualTime/create)
+        a (fleet/start (config "clj-card-refresh" (free-port) nil {:agents true :card-refresh "5m" :time vt}))
         bound (agents/bind! a (->Clerk))]
     (try
-      (is (instance? ScheduledExecutorService (:card-refresher a)))
+      (is (identical? vt (.time ^ai.badmonkey.agentspaces.peering.node.PeerNode (:node a))) "the :time option is the node's")
+      (is (instance? java.lang.AutoCloseable (:card-refresher a)))
+      (is (zero? (:refreshes @(:card-refresher a))))
       (let [first-issued (card-issued a)]
         (is (instance? Instant first-issued) "the bound card is in the discovery cache")
-        (testing "the card's issue time advances on the :card-refresh cadence"
-          (is (await-truthy 5000 #(let [now (card-issued a)]
-                                    (and now (.isAfter now first-issued)))))))
+        (testing "the card is re-issued on the :card-refresh cadence, in virtual time"
+          (.advance vt (Duration/ofMinutes 5))
+          (is (= 1 (:refreshes @(:card-refresher a))))
+          (is (.isAfter ^Instant (card-issued a) first-issued))
+          (.advance vt (Duration/ofMinutes 10))
+          (is (= 3 (:refreshes @(:card-refresher a))))))
+      (is (empty? (filter #(= "agentspaces-card-refresh" (.getName ^Thread %)) (.keySet (Thread/getAllStackTraces))))
+          "no card-refresh thread of its own")
       (agents/unbind! bound)
       (finally
         (fleet/stop! a)
-        (is (.isShutdown ^ScheduledExecutorService (:card-refresher a)) "stop! shuts the refresher down")))))
+        (is (false? (:running @(:card-refresher a))) "stop! closes the refresher")
+        (let [n (:refreshes @(:card-refresher a))]
+          (.advance vt (Duration/ofMinutes 10))
+          (is (= n (:refreshes @(:card-refresher a))) "a closed refresher arms no more runs"))))))
+
+(deftest the-membership-and-beacon-defaults-are-the-cores
+  ;; decision 17 and EL-O-11: no :ttl means the 45 s floor with a 30 s keepalive, not the old 30 s judge
+  (let [a (fleet/start (config "clj-defaults" (free-port) nil {} {:membership-tuning nil}))]
+    (try
+      (let [cfg (.config (.membership ^ai.badmonkey.agentspaces.peering.node.GroupRuntime (:runtime a)))]
+        (is (= (Duration/ofSeconds 45) (.memberTtl cfg)))
+        (is (= (Duration/ofSeconds 30) (.keepaliveTtl cfg))))
+      (finally (fleet/stop! a))))
+  (testing "a strict TTL floor refuses a member TTL under 60 s unless an override names it"
+    (is (thrown? ai.badmonkey.agentspaces.common.time.TtlFloor$TtlFloorException
+                 (fleet/start (config "clj-strict" (free-port) nil {:ttl {:strict true}}
+                                      {:membership-tuning {:ttl "20s"}}))))
+    (let [b (fleet/start (config "clj-override" (free-port) nil
+                                 {:ttl {:strict true
+                                        :expert-overrides {"agentspaces.membership.member-ttl" "a lab test"}}}
+                                 {:membership-tuning {:ttl "20s"}}))]
+      (fleet/stop! b))))
+
+;; ------------------------------------------- §10.33: the starter's binder and watchdog settings
+
+(defagent Hasty
+  {:description "Takes with a lease under the floor"}
+  (take hurry [^Fixtures$TaskEntry t] {:space "work" :lease "20s" :poll-timeout "200ms"}
+    ^Fixtures$FindingEntry
+    (Fixtures$FindingEntry. (:topic t) "hurried")))
+
+(deftest the-binder-and-the-node-take-the-starters-floor-hold-limit-and-escalation
+  ;; srad/agentspaces-event-loop.md §10.33: before, the floor was checked at start and dropped, so a defagent's
+  ;; 20 s take lease bound under {:ttl {:strict true}}; and :watchdog was not read at all
+  (testing "a strict floor refuses a bound agent's take lease under 60 s, as the starter's binder does"
+    (let [a (fleet/start (config "clj-floor-bind" (free-port) nil {:ttl {:strict true}}))]
+      (try
+        (is (thrown? ai.badmonkey.agentspaces.common.time.TtlFloor$TtlFloorException
+                     (agents/bind! a (->Hasty))))
+        (finally (fleet/stop! a)))))
+  (testing ":watchdog sets the binder's hold limit and the node's escalation; loop-health reads the loop"
+    (let [a (fleet/start (config "clj-watchdog" (free-port) nil
+                                 {:watchdog {:hold-limit "5m" :escalation "exit"}}))
+          seen (atom [])]
+      (try
+        (is (= (Duration/ofMinutes 5) (.holdLimit (.binder ^ai.badmonkey.agentspaces.agent.AgentSpaces$GroupContext
+                                                           (:group-context a)))))
+        (is (= "EXIT" (.name (.watchdogEscalation ^ai.badmonkey.agentspaces.peering.node.PeerNode (:node a)))))
+        (is (= :ok (:state (fleet/loop-health a))))
+        (fleet/on-loop-health! a #(swap! seen conj %))
+        (finally (fleet/stop! a))))))
 
 ;; ---------------------------------------------------------- C3: locators and chain
 

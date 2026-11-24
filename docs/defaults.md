@@ -46,7 +46,18 @@ space credential, or a vote identity that names one does not name the other.
 Set `:group {:agent "app"}` on the Clojure side when a fleet mixes the two
 and its admission rules name the starter's agents, or name both.
 
-**Tick loops in tests advance real time.** `fleet/start` ticks the node on a
-real scheduler (`:tick`). Anti-entropy paces itself by the group's gossip
-period, so a test that wants several anti-entropy rounds waits real seconds;
-the bundled tests use bounded polling helpers for this.
+**Tests can run on virtual time.** Since 0.7.0 the node runs each piece of due
+work at its own deadline, and `fleet/start` reads one time source for the node
+and everything it builds over it. Pass `:time (VirtualTime/create)` (from
+`agentspaces-test-support`) and move protocol time with `(.advance vt
+(Duration/ofSeconds 30))`: anti-entropy rounds, card refreshes, settle spans and
+lease renewals run with no real wait. `:tick` no longer paces the node; it only
+sets the cadence of the deprecated onTick adapters. The older bundled tests
+still use bounded polling helpers over real time.
+
+**The member TTL is the core's default.** With no `:membership-tuning :ttl` a
+member is judged at the 45 s floor, and this node keeps its own keepalive
+inside 30 s for older judges (SPEC §5.2). Before 0.7.0 the Clojure default was
+30 s. A configured `:ttl` under 60 s warns at start, or refuses under `:ttl
+{:strict true}`, unless `:ttl {:expert-overrides {"agentspaces.membership.member-ttl"
+"reason"}}` names it.
