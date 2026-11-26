@@ -1106,7 +1106,7 @@
                    (transport.tls.*)
     :require-attestation  frames must arrive on a channel attested for
                    their sender; pair with :transport :tls (node builder)
-    :multicast     true or {:group \"239.255.42.99:7787\" :interval \"5s\"},
+    :multicast     true or {:group \"239.255.42.99:7787\" :interval \"60s\"},
                    the LAN bootstrap beacon, also asked as a join locator
                    (multicast.*)
     :revocation-validator  a RevocationRegistry.RevocationValidator
